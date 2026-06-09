@@ -10,10 +10,11 @@ import (
 )
 
 // perStreamBudget is the RAM we conservatively reserve per concurrent stream when
-// auto-deriving MAX_CONCURRENT. The actual live buffer is ~64 KB, but a real
-// connection also costs net/http read/write buffers, TLS state, and the upstream
-// side — so we budget 512 KB to stay safe under real (non-loopback) traffic.
-const perStreamBudget = 512 * 1024
+// auto-deriving MAX_CONCURRENT. The live copy buffer is 1 MB (see bufPool), plus
+// net/http read/write buffers, TLS state, and the upstream side — so we budget
+// ~1.5 MB to stay safe under real traffic. Bigger buffer = fewer concurrent
+// streams auto-allowed, which is correct.
+const perStreamBudget = 1536 * 1024
 
 // autoTune inspects the machine/container and picks sane runtime defaults,
 // logging what it found. Explicit env vars (GOMAXPROCS, MAX_CONCURRENT) always

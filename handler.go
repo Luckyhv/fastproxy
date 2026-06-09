@@ -20,7 +20,7 @@ import (
 // stream). 64 KB is a good middle for video.
 var bufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 64*1024)
+		b := make([]byte, 1024*1024) // 1 MB: fewer read/write syscalls, max throughput on big files
 		return &b
 	},
 }
