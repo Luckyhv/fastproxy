@@ -1,0 +1,4 @@
+/fastproxy
+*.log
+.env
+.env.*

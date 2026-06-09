@@ -1,0 +1,45 @@
+# fastproxy
+
+A Go HLS/mp4 streaming proxy. Built because Bun (`../proxy`) can't bound
+per-stream RAM — under a slow client it buffers the whole asset (~2–3 GB/stream,
+measured), while Go's blocking `io.CopyBuffer` holds backpressure and stays flat
+(~64 KB/stream).
+
+## Run
+
+```sh
+go build -o fastproxy .
+PORT=3847 SECRET_KEY=aproxy2026 ./fastproxy
+```
+
+Generate a test link (XOR+base64url, compatible with the Bun proxy / frontend):
+
+```sh
+./fastproxy encode "https://host/master.m3u8" "https://referer.site"
+# -> paste after /stream/  ->  http://localhost:3847/stream/<token>
+```
+
+## Env vars
+
+| var | default | meaning |
+|-----|---------|---------|
+| `PORT` | `3847` | listen port |
+| `SECRET_KEY` | `aproxy2026` | payload XOR key (must match frontend) |
+| `UPSTREAM_PROXY` | _(none)_ | egress proxy URL for blocked hosts, e.g. `http://user:pass@host:port` |
+| `UPSTREAM_PROXY_DOMAINS` | _(none)_ | comma list of host suffixes to route via the proxy; empty + proxy set = all |
+| `MAX_CONCURRENT` | `0` | max simultaneous streams (0 = unlimited); excess gets `503` |
+| `INSECURE_TLS` | _(off)_ | `1` to skip upstream cert verification (sketchy CDNs only) |
+
+## What it does
+
+- Decrypts the target URL from the path, forges `Referer`/`Origin`.
+- Rewrites HLS manifests (`.m3u8`) so every segment/key/variant routes back through us.
+- Streams everything else with bounded RAM (backpressured copy).
+- Rewrites 3xx redirects back through the proxy.
+- Wildcard CORS (no credentials/Vary) + immutable cache headers → CDN-friendly.
+
+## Scaling
+
+Put a CDN in front (the cache headers do the work), raise `ulimit -n`, and only
+add instances behind a load balancer if one box's bandwidth saturates. See the
+project notes for the full reasoning.
