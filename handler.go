@@ -225,7 +225,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			out.Set(k, v)
 		}
 	}
-	setAssetCache(out, target.Path, resp.StatusCode)
+	setAssetCache(out, target.Path, resp.StatusCode, resp.Header.Get("Content-Type"))
 
 	// 6. Send the upstream status line (200 full body, 206 for a Range).
 	w.WriteHeader(resp.StatusCode)

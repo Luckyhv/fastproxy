@@ -133,6 +133,21 @@ func isCacheableAsset(path string) bool {
 	return cacheableExt[strings.ToLower(path[i+1:])]
 }
 
+// isCacheableContentType is the fallback when the URL has no usable extension
+// (common — our proxy paths are /stream/<token>, and many providers use
+// extension-less segment URLs). A 200 of this content-type is static media and
+// safe to cache hard. Manifests are handled separately, so they never reach here.
+func isCacheableContentType(ct string) bool {
+	ct = strings.ToLower(ct)
+	return strings.HasPrefix(ct, "video/") ||
+		strings.HasPrefix(ct, "audio/") ||
+		strings.HasPrefix(ct, "image/") ||
+		strings.HasPrefix(ct, "font/") ||
+		strings.Contains(ct, "mp2t") || // .ts segments
+		strings.Contains(ct, "octet-stream") ||
+		strings.Contains(ct, "vtt") // subtitles
+}
+
 // Cache policies. We set THREE headers so each layer obeys independently:
 //   Cache-Control            -> the browser
 //   CDN-Cache-Control        -> standards-compliant CDNs (Fastly, etc.)
@@ -159,7 +174,7 @@ func setCC(h http.Header, policy string) {
 // Content-Range. That's the mp4 bug. The CDN still caches mp4 fine: when it wants
 // to populate cache it fetches the FULL file (no Range) and gets the cacheable
 // 200 below, then serves ranges out of that full object itself.
-func setAssetCache(h http.Header, path string, status int) {
+func setAssetCache(h http.Header, path string, status int, contentType string) {
 	switch {
 	case status == http.StatusPartialContent: // 206
 		// Never cache a partial. Works for the client, just not stored at the edge.
@@ -168,7 +183,8 @@ func setAssetCache(h http.Header, path string, status int) {
 		// Never let a CDN pin an error — a transient upstream blip would otherwise
 		// break that asset at the edge for a year.
 		setCC(h, noStore)
-	case isCacheableAsset(path): // full 200 of a media asset
+	case isCacheableAsset(path) || isCacheableContentType(contentType):
+		// full 200 of a media asset (by extension OR content-type)
 		setCC(h, immutableForever)
 	}
 }

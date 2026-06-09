@@ -78,7 +78,18 @@ var httpClient = &http.Client{
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 
-		ForceAttemptHTTP2: true, // use h2 to upstreams that support it
+		// Force HTTP/1.1 to upstream. Go's HTTP/2 client uses small flow-control
+		// windows (~64 KB/stream); on a high-latency VPS→CDN path that throttles
+		// large media to ~window/RTT (e.g. 64KB/50ms ≈ 1.3 MB/s), making mp4
+		// fetches crawl. HTTP/1.1 has no such app-level cap and streams at full TCP
+		// speed — and for a proxy (one big sequential download per request) h2's
+		// multiplexing buys nothing. A non-nil empty TLSNextProto disables h2.
+		ForceAttemptHTTP2: false,
+		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
+
+		// Bigger socket buffers = fewer syscalls on large transfers (default 4 KB).
+		ReadBufferSize:  64 * 1024,
+		WriteBufferSize: 64 * 1024,
 
 		// Connection-pool sizing. These caps are what let one box fan out to many
 		// concurrent viewers without exhausting sockets.
