@@ -1,0 +1,26 @@
+[Unit]
+Description=fastproxy HLS/mp4 streaming proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=fastproxy
+Group=fastproxy
+WorkingDirectory=/opt/fastproxy
+ExecStart=/opt/fastproxy/fastproxy
+Restart=always
+RestartSec=2
+
+# Each live stream is a file descriptor — lift the default 1024 ceiling so the
+# box can fan out to many concurrent viewers.
+LimitNOFILE=1048576
+
+# Basic hardening.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

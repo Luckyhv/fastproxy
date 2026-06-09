@@ -34,7 +34,10 @@ func main() {
 		log.Printf("origin allow-list: OPEN — set ALLOWED_ORIGINS to restrict")
 	}
 
-	addr := ":" + getenv("PORT", "3847")
+	// BIND_ADDR lets you restrict the listen interface. Behind a reverse proxy
+	// (Caddy/nginx) on the same box, set BIND_ADDR=127.0.0.1 so the proxy is not
+	// reachable from the public internet directly. Empty = all interfaces.
+	addr := getenv("BIND_ADDR", "") + ":" + getenv("PORT", "3847")
 
 	srv := &http.Server{
 		Addr:    addr,

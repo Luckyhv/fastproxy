@@ -1,0 +1,17 @@
+# Caddy reverse proxy in front of fastproxy.
+# Change the hostname to your subdomain. `tls internal` issues a local cert that
+# Cloudflare accepts when its SSL mode is "Full" (CF terminates the public TLS;
+# this just secures the CF<->origin hop). For "Full (strict)", replace the tls
+# line with a Cloudflare Origin Certificate:  tls /etc/ssl/cf-origin.pem /etc/ssl/cf-origin.key
+
+prox.anikage.cc {
+	tls internal
+
+	reverse_proxy 127.0.0.1:3847 {
+		# Stream large bodies through without buffering the whole response.
+		flush_interval -1
+		# Preserve the client headers the proxy relies on.
+		header_up Host {host}
+		header_up X-Forwarded-For {remote_host}
+	}
+}
