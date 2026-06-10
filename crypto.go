@@ -25,8 +25,8 @@ func xorWithSecret(data []byte, secret string) {
 // The 0x00 is a separator so Decode knows where the URL ends and referer begins.
 func EncodePayload(targetURL, referer string) string {
 	payload := make([]byte, len(targetURL)+1+len(referer))
-	copy(payload, targetURL)               // [0 .. len(url))      = url
-	payload[len(targetURL)] = 0x00         // [len(url)]           = separator
+	copy(payload, targetURL)                  // [0 .. len(url))      = url
+	payload[len(targetURL)] = 0x00            // [len(url)]           = separator
 	copy(payload[len(targetURL)+1:], referer) // [len(url)+1 ..]   = referer
 	xorWithSecret(payload, secretKey)
 	// RawURLEncoding = base64url WITHOUT '=' padding — safe inside a URL path and

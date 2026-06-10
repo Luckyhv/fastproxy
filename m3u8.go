@@ -85,10 +85,10 @@ func rewriteTagLine(line string, base *url.URL, encode func(*url.URL) string) st
 		}
 		end += start
 
-		b.WriteString(line[i:start])                       // everything up to & incl. URI="
+		b.WriteString(line[i:start])                          // everything up to & incl. URI="
 		b.WriteString(encode(resolve(line[start:end], base))) // rewritten value
-		b.WriteByte('"')                                   // closing quote
-		i = end + 1                                         // continue after it
+		b.WriteByte('"')                                      // closing quote
+		i = end + 1                                           // continue after it
 	}
 	return b.String()
 }

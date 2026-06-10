@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -13,14 +14,28 @@ import (
 	"syscall"
 )
 
-// bufPool hands out 64 KB scratch buffers and takes them back when a stream
-// ends, so we don't allocate (and then garbage-collect) a fresh buffer for every
+// isPublicHost is the cheap, no-DNS SSRF check on the target hostname: reject
+// "localhost" and literal private/loopback IPs outright for a clean 403. Real
+// hostnames pass here and are validated against their RESOLVED ip by the
+// transport's dialControl (which also catches DNS rebinding).
+func isPublicHost(host string) bool {
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return isPublicIP(ip)
+	}
+	return true // hostname — dialControl validates the resolved IP
+}
+
+// bufPool hands out 1 MB scratch buffers and takes them back when a stream ends,
+// so we don't allocate (and then garbage-collect) a fresh buffer for every
 // request. Buffer size is a knob: smaller = less RAM per concurrent stream (more
-// viewers per box), larger = fewer read/write syscalls (more throughput per
-// stream). 64 KB is a good middle for video.
+// viewers per box), larger = fewer read/write syscalls (more throughput per big
+// file). 1 MB favors throughput; autoTune()'s perStreamBudget is sized to match.
 var bufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 1024*1024) // 1 MB: fewer read/write syscalls, max throughput on big files
+		b := make([]byte, 1024*1024) // 1 MB
 		return &b
 	},
 }
@@ -43,9 +58,10 @@ var headersToForward = []string{
 var knownRoutes = map[string]bool{"stream": true, "m3u8": true, "hls": true}
 
 // extractPayload pulls the encrypted token out of the request path. It handles
-//   /stream/<token>          -> <token>
-//   /stream/<token>/seg.jpg  -> <token>   (suffixes added in the m3u8 part)
-//   /<token>                 -> <token>
+//
+//	/stream/<token>          -> <token>
+//	/stream/<token>/seg.jpg  -> <token>   (suffixes added in the m3u8 part)
+//	/<token>                 -> <token>
 func extractPayload(path string) string {
 	path = strings.Trim(path, "/")
 	if path == "" {
@@ -110,10 +126,10 @@ func serveManifest(w http.ResponseWriter, resp *http.Response, base *url.URL, re
 }
 
 // inFlight optionally caps how many streams we serve at once. Backpressure
-// already bounds RAM per stream (~64 KB), but a hard ceiling protects against
-// running out of file descriptors / sockets under a stampede. It is sized by
-// autoTune() at startup (from MAX_CONCURRENT, or derived from detected RAM).
-// nil = unlimited. When full we shed load with 503 rather than queueing.
+// already bounds RAM per stream (~1 MB buffer), but a hard ceiling protects
+// against running out of file descriptors / sockets under a stampede. It is
+// sized by autoTune() at startup (from MAX_CONCURRENT, or derived from detected
+// RAM). nil = unlimited. When full we shed load with 503 rather than queueing.
 var inFlight chan struct{}
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +157,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	target, err := url.Parse(rawURL)
 	if err != nil || (target.Scheme != "http" && target.Scheme != "https") {
 		http.Error(w, "bad url", http.StatusBadRequest)
+		return
+	}
+	// SSRF guard: refuse targets that resolve to loopback/private/link-local
+	// space, so a forged token can't make us fetch internal services or cloud
+	// metadata (169.254.169.254). External video CDNs are always public IPs.
+	if !isPublicHost(target.Hostname()) {
+		http.Error(w, "forbidden target", http.StatusForbidden)
 		return
 	}
 
@@ -236,11 +259,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 7. THE BACKPRESSURED COPY — the heart of the whole thing.
-	//    io.CopyBuffer does: read up to 64 KB from upstream -> write it to the
+	//    io.CopyBuffer does: read up to 1 MB from upstream -> write it to the
 	//    client -> repeat. The write BLOCKS until the client's TCP send buffer
 	//    has room. A slow viewer therefore slows our reads from upstream, so at
-	//    most ~one buffer is in flight per connection. That is the 12 MB-flat
-	//    behavior we measured — RAM stays bounded no matter how slow the client.
+	//    most ~one buffer is in flight per connection — RAM stays bounded (flat)
+	//    no matter how slow the client, instead of buffering the whole file.
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
 	if _, err := io.CopyBuffer(w, resp.Body, *buf); err != nil && !isClientGone(err) {

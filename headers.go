@@ -80,6 +80,14 @@ func originAllowed(r *http.Request) bool {
 // means every code path — stream, manifest, error — gets CORS for free.
 func withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Health check for load balancers — answered BEFORE the allow-list, since
+		// CF's health monitor sends no Origin/Referer (which would otherwise 403).
+		if r.URL.Path == "/health" {
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+			return
+		}
 		setCORS(w.Header())
 		// Gate on the Origin/Referer allow-list (no-op when ALLOWED_ORIGINS unset).
 		if !originAllowed(r) {
@@ -149,9 +157,10 @@ func isCacheableContentType(ct string) bool {
 }
 
 // Cache policies. We set THREE headers so each layer obeys independently:
-//   Cache-Control            -> the browser
-//   CDN-Cache-Control        -> standards-compliant CDNs (Fastly, etc.)
-//   Cloudflare-CDN-Cache-Control -> Cloudflare specifically
+//
+//	Cache-Control            -> the browser
+//	CDN-Cache-Control        -> standards-compliant CDNs (Fastly, etc.)
+//	Cloudflare-CDN-Cache-Control -> Cloudflare specifically
 const (
 	immutableForever = "public, max-age=31536000, s-maxage=31536000, immutable"
 	manifestPolicy   = "public, max-age=300, s-maxage=14400" // browser 5m, edge 4h

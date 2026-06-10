@@ -2,12 +2,38 @@ package main
 
 import (
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 )
+
+// isPublicIP reports whether an IP is a routable public address — i.e. NOT
+// loopback, private (RFC1918 / ULA), link-local (incl. 169.254.169.254 cloud
+// metadata), or unspecified. Used by the SSRF guard.
+func isPublicIP(ip net.IP) bool {
+	return !(ip.IsLoopback() || ip.IsPrivate() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsUnspecified())
+}
+
+// dialControl runs AFTER DNS resolution, with the concrete IP we're about to
+// connect to. Rejecting non-public IPs here is the real SSRF backstop: it
+// catches a hostname that resolves to a private/loopback address (DNS rebinding),
+// which a handler-side string check on the hostname cannot.
+func dialControl(network, address string, _ syscall.RawConn) error {
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	if ip := net.ParseIP(host); ip != nil && !isPublicIP(ip) {
+		return fmt.Errorf("blocked non-public address: %s", host)
+	}
+	return nil
+}
 
 // insecureTLS, when INSECURE_TLS=1, makes us skip upstream certificate
 // verification. Some sketchy video CDNs serve expired/self-signed/mismatched
@@ -22,11 +48,12 @@ var insecureTLS = getenv("INSECURE_TLS", "") == "1"
 // while everything else goes direct (proxies are slow + metered, so we don't
 // want all traffic on them).
 //
-//   UPSTREAM_PROXY          = http://user:pass@host:port   (the egress proxy)
-//   UPSTREAM_PROXY_DOMAINS  = vid-cdn.xyz,foo.com          (suffixes to route)
+//	UPSTREAM_PROXY          = http://user:pass@host:port   (the egress proxy)
+//	UPSTREAM_PROXY_DOMAINS  = vid-cdn.xyz,foo.com          (suffixes to route)
+//
 // If UPSTREAM_PROXY is set but DOMAINS is empty, ALL upstream traffic is proxied.
 var (
-	upstreamProxyURL, _ = url.Parse(getenv("UPSTREAM_PROXY", ""))
+	upstreamProxyURL, _  = url.Parse(getenv("UPSTREAM_PROXY", ""))
 	upstreamProxyDomains = parseDomains(getenv("UPSTREAM_PROXY_DOMAINS", ""))
 )
 
@@ -76,6 +103,7 @@ var httpClient = &http.Client{
 		DialContext: (&net.Dialer{
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
+			Control:   dialControl, // SSRF backstop on the resolved IP
 		}).DialContext,
 
 		// Force HTTP/1.1 to upstream. Go's HTTP/2 client uses small flow-control
