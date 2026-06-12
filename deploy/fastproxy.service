@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=fastproxy
-Group=fastproxy
-WorkingDirectory=/opt/fastproxy
-ExecStart=/opt/fastproxy/fastproxy
+User=root
+Group=root
+WorkingDirectory=/root/projects/fastproxy
+ExecStart=/root/projects/fastproxy/fastproxy
 Restart=always
 RestartSec=2
 
@@ -19,7 +19,7 @@ LimitNOFILE=1048576
 # Basic hardening.
 NoNewPrivileges=true
 ProtectSystem=full
-ProtectHome=true
+ProtectHome=false
 PrivateTmp=true
 
 [Install]
