@@ -52,6 +52,8 @@ SECRET_KEY=change-me
 # Sites allowed to use the proxy (their Origin/Referer). Subdomains included.
 # This is the FRONTEND domain, not the proxy's own domain. Empty = open.
 ALLOWED_ORIGINS=yourfrontend.com,localhost
+# Gates the metrics dashboard. Unset = /stats & /dashboard 404 (no exposure).
+STATS_TOKEN=change-me-too
 EOF
 ```
 
@@ -149,6 +151,23 @@ sudo systemctl restart fastproxy
 # if the Caddyfile changed:
 sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
 ```
+
+## Dashboard
+
+fastproxy serves a built-in metrics dashboard (atomic counters, in-process —
+near-zero cost). It rides through the same Caddy reverse proxy, no extra config.
+
+- Set `STATS_TOKEN` in `.env` (any secret). Unset = `/stats` and `/dashboard`
+  both `404`, so metrics are never exposed by accident.
+- Open `https://proxy.anicore.tv/dashboard#<STATS_TOKEN>`. The token rides in the
+  URL `#hash` (never sent to the server / logs); the page reads it and polls
+  `/stats?token=…` over TLS every 2s.
+- Tiles: active streams, downstream/upstream bandwidth (live B/s + totals),
+  requests, manifests, redirects, upstream errors, rejected, 503s, heap,
+  goroutines, uptime. Counters sit after the origin allow-list, so they reflect
+  real frontend traffic, not anonymous scanner hits.
+
+Both endpoints send `Cache-Control: no-store`, so Cloudflare never caches them.
 
 ## Caching
 

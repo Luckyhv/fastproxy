@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 )
 
@@ -100,7 +101,8 @@ func serveManifest(w http.ResponseWriter, resp *http.Response, base *url.URL, re
 			w.Header().Set("Content-Type", ct)
 		}
 		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(body)
+		nw, _ := w.Write(body)
+		atomic.AddInt64(&mBytesDown, int64(nw))
 		return
 	}
 
@@ -122,7 +124,8 @@ func serveManifest(w http.ResponseWriter, resp *http.Response, base *url.URL, re
 		setCC(h, noStore)
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(rewritten)
+	nw, _ := w.Write(rewritten)
+	atomic.AddInt64(&mBytesDown, int64(nw))
 }
 
 // inFlight optionally caps how many streams we serve at once. Backpressure
@@ -138,24 +141,34 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		case inFlight <- struct{}{}: // got a slot
 			defer func() { <-inFlight }()
 		default:
+			atomic.AddInt64(&mBusy, 1)
 			http.Error(w, "server busy", http.StatusServiceUnavailable)
 			return
 		}
 	}
 
+	// Count this as an accepted request and track it as in-flight for the whole
+	// proxied lifetime (released when the handler returns).
+	atomic.AddInt64(&mTotalReq, 1)
+	atomic.AddInt64(&mActive, 1)
+	defer atomic.AddInt64(&mActive, -1)
+
 	// 1. Decode the encrypted target from the path, e.g. /stream/<payload>.
 	token := extractPayload(r.URL.Path)
 	if token == "" {
+		atomic.AddInt64(&mRejected, 1)
 		http.Error(w, "missing payload", http.StatusBadRequest)
 		return
 	}
 	rawURL, referer, ok := DecodePayload(token)
 	if !ok {
+		atomic.AddInt64(&mRejected, 1)
 		http.Error(w, "invalid payload", http.StatusBadRequest)
 		return
 	}
 	target, err := url.Parse(rawURL)
 	if err != nil || (target.Scheme != "http" && target.Scheme != "https") {
+		atomic.AddInt64(&mRejected, 1)
 		http.Error(w, "bad url", http.StatusBadRequest)
 		return
 	}
@@ -163,6 +176,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// space, so a forged token can't make us fetch internal services or cloud
 	// metadata (169.254.169.254). External video CDNs are always public IPs.
 	if !isPublicHost(target.Hostname()) {
+		atomic.AddInt64(&mRejected, 1)
 		http.Error(w, "forbidden target", http.StatusForbidden)
 		return
 	}
@@ -215,9 +229,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//    nothing has been downloaded into memory yet at this line.
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		atomic.AddInt64(&mUpstreamErr, 1)
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
 	}
+	// Count every byte we pull from the origin (ingress). Wrapping here covers
+	// both the streaming copy and the manifest read below.
+	resp.Body = &countingReadCloser{rc: resp.Body, n: &mBytesUp}
 	defer resp.Body.Close() // always release the upstream connection
 
 	// 4a. Redirect? Upstream often 302s a segment to a signed CDN URL. We don't
@@ -226,6 +244,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//     through us (referer preserved), and redirect the player to OUR path.
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		if loc := resp.Header.Get("Location"); loc != "" {
+			atomic.AddInt64(&mRedirects, 1)
 			abs := resolve(loc, target)
 			http.Redirect(w, r, "/stream/"+EncodePayload(abs.String(), referer), resp.StatusCode)
 			return
@@ -236,6 +255,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//     URL to point back through us, and serve the modified text — NOT stream
 	//     it raw. Detect by the target's extension or the response content-type.
 	if isM3U8Path(target.Path) || isM3U8ContentType(resp.Header.Get("Content-Type")) {
+		atomic.AddInt64(&mManifests, 1)
 		serveManifest(w, resp, target, referer)
 		return
 	}
@@ -266,7 +286,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//    no matter how slow the client, instead of buffering the whole file.
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
-	if _, err := io.CopyBuffer(w, resp.Body, *buf); err != nil && !isClientGone(err) {
+	n, err := io.CopyBuffer(w, resp.Body, *buf)
+	atomic.AddInt64(&mBytesDown, n) // bytes delivered to client (egress)
+	if err != nil && !isClientGone(err) {
 		// Only log genuine failures — client disconnects (seek/close) are normal
 		// for video and would otherwise spam the log on every interaction.
 		log.Printf("stream error: %v", err)

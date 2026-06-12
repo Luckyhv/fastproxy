@@ -39,9 +39,16 @@ func main() {
 	// reachable from the public internet directly. Empty = all interfaces.
 	addr := getenv("BIND_ADDR", "") + ":" + getenv("PORT", "3847")
 
+	// Route the metrics endpoints separately; everything else is the proxy.
+	// /stats and /dashboard are gated by STATS_TOKEN (404 when unset/wrong).
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stats", statsHandler)
+	mux.HandleFunc("/dashboard", dashboardHandler)
+	mux.Handle("/", withCORS(handleProxy))
+
 	srv := &http.Server{
 		Addr:    addr,
-		Handler: withCORS(handleProxy),
+		Handler: mux,
 
 		// Time allowed to read just the request *headers*. Protects against a
 		// client that opens a connection and dribbles bytes forever (Slowloris).
