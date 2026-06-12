@@ -1,0 +1,21 @@
+# Caddy reverse proxy in front of fastproxy.
+#
+# Uses the Cloudflare Origin Certificate already installed at
+# /etc/ssl/cloudflare/, which pairs with Cloudflare SSL mode "Full (strict)".
+# CF terminates the public TLS; this secures the CF<->origin hop and CF verifies
+# the cert.
+#
+# (If you ever drop the origin cert, replace the `tls` line with `tls internal`
+# and set Cloudflare SSL mode to "Full".)
+
+proxy.anicore.tv {
+	tls /etc/ssl/cloudflare/cert.pem /etc/ssl/cloudflare/key.pem
+
+	reverse_proxy 127.0.0.1:3847 {
+		# Stream large bodies through without buffering the whole response.
+		flush_interval -1
+		# Preserve the client headers the proxy relies on.
+		header_up Host {host}
+		header_up X-Forwarded-For {remote_host}
+	}
+}
