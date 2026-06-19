@@ -189,6 +189,9 @@ func setAssetCache(h http.Header, path string, status int, contentType string) {
 	case status == http.StatusPartialContent: // 206
 		// Never cache a partial. Works for the client, just not stored at the edge.
 		setCC(h, noStore)
+	case status == http.StatusNotModified: // 304
+		// A revalidation hit. Setting no-store here would tell the browser to drop
+		// the copy it just validated — leave cache headers alone.
 	case status != http.StatusOK: // 403/404/5xx
 		// Never let a CDN pin an error — a transient upstream blip would otherwise
 		// break that asset at the edge for a year.
