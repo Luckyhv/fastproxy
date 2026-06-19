@@ -164,6 +164,7 @@ func isCacheableContentType(ct string) bool {
 const (
 	immutableForever = "public, max-age=31536000, s-maxage=31536000, immutable"
 	manifestPolicy   = "public, max-age=300, s-maxage=14400" // browser 5m, edge 4h
+	livePolicy       = "public, max-age=1, s-maxage=2"       // sliding live playlists
 	noStore          = "no-store"
 )
 
