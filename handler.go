@@ -65,6 +65,15 @@ type readerCloser struct {
 	io.Closer
 }
 
+// isSniffableContentType: content-types vague enough that the body might really
+// be an HLS playlist. video/audio/image types are definitely not manifests.
+func isSniffableContentType(ct string) bool {
+	ct = strings.ToLower(ct)
+	return ct == "" ||
+		strings.HasPrefix(ct, "text/plain") ||
+		strings.HasPrefix(ct, "application/octet-stream")
+}
+
 // knownRoutes are the path prefixes the player will hit. The encrypted token is
 // the segment right after the prefix. We keep a small set so a bare /<token>
 // also works.
