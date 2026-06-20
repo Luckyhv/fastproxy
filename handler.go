@@ -53,6 +53,18 @@ var headersToForward = []string{
 	"ETag",
 }
 
+// allowRawURL enables plain-URL mode (/stream?url=...). On by default so any
+// HLS stream can be proxied without pre-encoding a token; set ALLOW_RAW_URL=0
+// to require tokens (i.e. knowledge of SECRET_KEY) instead.
+var allowRawURL = getenv("ALLOW_RAW_URL", "1") != "0"
+
+// readerCloser lets us swap a response body's Reader (e.g. after sniffing a few
+// bytes) while still closing the ORIGINAL body to release the connection.
+type readerCloser struct {
+	io.Reader
+	io.Closer
+}
+
 // knownRoutes are the path prefixes the player will hit. The encrypted token is
 // the segment right after the prefix. We keep a small set so a bare /<token>
 // also works.
