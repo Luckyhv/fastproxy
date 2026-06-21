@@ -275,18 +275,49 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
 	}
+	// 4a. Redirect? Upstream often 302s a segment to a signed CDN URL. Follow it
+	//     SERVER-SIDE (up to 5 hops): each browser-side bounce would cost a full
+	//     extra client round-trip per segment. Every hop re-passes the SSRF guard
+	//     (plus dialControl on the resolved IP). Only safe for GET/HEAD — a POST
+	//     body was already consumed, so those fall back to a client redirect.
+	for hops := 0; hops < 5 && resp.StatusCode >= 300 && resp.StatusCode < 400 && r.Method != http.MethodPost; hops++ {
+		loc := resp.Header.Get("Location")
+		if loc == "" {
+			break
+		}
+		atomic.AddInt64(&mRedirects, 1)
+		abs := resolve(loc, target)
+		resp.Body.Close() // release the redirect response's connection
+		if (abs.Scheme != "http" && abs.Scheme != "https") || !isPublicHost(abs.Hostname()) {
+			atomic.AddInt64(&mRejected, 1)
+			http.Error(w, "forbidden redirect target", http.StatusForbidden)
+			return
+		}
+		target = abs
+		nreq, nerr := http.NewRequestWithContext(r.Context(), upstreamMethod, target.String(), nil)
+		if nerr != nil {
+			http.Error(w, "bad redirect", http.StatusBadGateway)
+			return
+		}
+		nreq.Header = req.Header // same forged headers on every hop
+		req = nreq
+		resp, err = httpClient.Do(req)
+		if err != nil {
+			atomic.AddInt64(&mUpstreamErr, 1)
+			http.Error(w, "upstream fetch failed", http.StatusBadGateway)
+			return
+		}
+	}
+
 	// Count every byte we pull from the origin (ingress). Wrapping here covers
 	// both the streaming copy and the manifest read below.
 	resp.Body = &countingReadCloser{rc: resp.Body, n: &mBytesUp}
 	defer resp.Body.Close() // always release the upstream connection
 
-	// 4a. Redirect? Upstream often 302s a segment to a signed CDN URL. We don't
-	//     want the BROWSER to follow it (it'd hit the origin directly, leaking it
-	//     and losing referer-forging). Instead we resolve the Location, re-wrap it
-	//     through us (referer preserved), and redirect the player to OUR path.
+	// Still 3xx (POST, redirect loop, or missing Location)? Re-wrap the Location
+	// through us and let the client bounce — never expose the origin URL.
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		if loc := resp.Header.Get("Location"); loc != "" {
-			atomic.AddInt64(&mRedirects, 1)
 			abs := resolve(loc, target)
 			http.Redirect(w, r, "/stream/"+EncodePayload(abs.String(), referer), resp.StatusCode)
 			return
