@@ -174,18 +174,32 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	atomic.AddInt64(&mActive, 1)
 	defer atomic.AddInt64(&mActive, -1)
 
-	// 1. Decode the encrypted target from the path, e.g. /stream/<payload>.
-	token := extractPayload(r.URL.Path)
-	if token == "" {
-		atomic.AddInt64(&mRejected, 1)
-		http.Error(w, "missing payload", http.StatusBadRequest)
-		return
-	}
-	rawURL, referer, ok := DecodePayload(token)
-	if !ok {
-		atomic.AddInt64(&mRejected, 1)
-		http.Error(w, "invalid payload", http.StatusBadRequest)
-		return
+	// 1. Resolve the target. Two ways in:
+	//    a) plain-URL mode: /stream?url=<absolute-url>&ref=<referer> — the easy
+	//       way to proxy any HLS stream. Disable with ALLOW_RAW_URL=0 if you only
+	//       want tokenized (key-tied) access.
+	//    b) token mode: /stream/<encrypted-payload> (what the frontend generates).
+	var rawURL, referer string
+	if q := r.URL.Query(); allowRawURL && q.Get("url") != "" {
+		rawURL = q.Get("url")
+		referer = q.Get("ref")
+		if referer == "" {
+			referer = q.Get("referer")
+		}
+	} else {
+		token := extractPayload(r.URL.Path)
+		if token == "" {
+			atomic.AddInt64(&mRejected, 1)
+			http.Error(w, "missing payload", http.StatusBadRequest)
+			return
+		}
+		var ok bool
+		rawURL, referer, ok = DecodePayload(token)
+		if !ok {
+			atomic.AddInt64(&mRejected, 1)
+			http.Error(w, "invalid payload", http.StatusBadRequest)
+			return
+		}
 	}
 	target, err := url.Parse(rawURL)
 	if err != nil || (target.Scheme != "http" && target.Scheme != "https") {
@@ -232,6 +246,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//    upstream for identity encoding (we never want gzip wrapping video bytes).
 	if rng := r.Header.Get("Range"); rng != "" {
 		req.Header.Set("Range", rng)
+	}
+	// Conditional headers let the browser/edge revalidate instead of re-download:
+	// upstream answers 304 (no body) and we pass it straight through.
+	for _, k := range []string{"If-None-Match", "If-Modified-Since", "If-Range"} {
+		if v := r.Header.Get(k); v != "" {
+			req.Header.Set(k, v)
+		}
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0")
 	req.Header.Set("Accept-Encoding", "identity")
