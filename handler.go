@@ -136,13 +136,19 @@ func serveManifest(w http.ResponseWriter, resp *http.Response, base *url.URL, re
 
 	h := w.Header()
 	h.Set("Content-Type", "application/vnd.apple.mpegurl")
-	// Manifests get a SHORT edge cache: long enough that a burst of viewers
-	// starting the same episode share one fetch, short enough that live/sliding
-	// playlists refresh. Only cache successful manifests.
-	if resp.StatusCode == http.StatusOK {
-		setCC(h, manifestPolicy)
-	} else {
+	// Cache policy depends on the playlist KIND. Master playlists and finished
+	// (VOD) media playlists never change → short-browser/long-edge cache so a
+	// burst of viewers shares one fetch. A live/event playlist (media playlist
+	// with no #EXT-X-ENDLIST) slides every few seconds — caching it at the edge
+	// for hours would freeze the stream, so it gets (near) no cache.
+	switch {
+	case resp.StatusCode != http.StatusOK:
 		setCC(h, noStore)
+	case bytes.Contains(body, []byte("#EXT-X-STREAM-INF")) || // master
+		bytes.Contains(body, []byte("#EXT-X-ENDLIST")): // finished VOD
+		setCC(h, manifestPolicy)
+	default: // live / sliding-window media playlist
+		setCC(h, livePolicy)
 	}
 	w.WriteHeader(resp.StatusCode)
 	nw, _ := w.Write(rewritten)
@@ -326,8 +332,19 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// 4b. Is this an HLS manifest? If so, we must read it, rewrite every child
 	//     URL to point back through us, and serve the modified text — NOT stream
-	//     it raw. Detect by the target's extension or the response content-type.
-	if isM3U8Path(target.Path) || isM3U8ContentType(resp.Header.Get("Content-Type")) {
+	//     it raw. Detect by the target's extension or the response content-type;
+	//     when both are ambiguous (extension-less URL + text/octet-stream
+	//     content-type, common on shady hosts) sniff the first bytes for #EXTM3U.
+	ct := resp.Header.Get("Content-Type")
+	isManifest := isM3U8Path(target.Path) || isM3U8ContentType(ct)
+	if !isManifest && resp.StatusCode == http.StatusOK && isSniffableContentType(ct) && !isCacheableAsset(target.Path) {
+		peek := make([]byte, len("#EXTM3U"))
+		n, _ := io.ReadFull(resp.Body, peek)
+		// Stitch the peeked bytes back in front of the remaining stream.
+		resp.Body = readerCloser{io.MultiReader(bytes.NewReader(peek[:n]), resp.Body), resp.Body}
+		isManifest = string(peek[:n]) == "#EXTM3U"
+	}
+	if isManifest {
 		atomic.AddInt64(&mManifests, 1)
 		serveManifest(w, resp, target, referer)
 		return
