@@ -12,7 +12,13 @@ go build -o fastproxy .
 PORT=3847 SECRET_KEY=aproxy2026 ./fastproxy
 ```
 
-Generate a test link (XOR+base64url, compatible with the Bun proxy / frontend):
+Proxy any HLS stream directly (raw-URL mode, no token needed — URL-encode it):
+
+```sh
+http://localhost:3847/stream?url=https%3A%2F%2Fhost%2Fmaster.m3u8&ref=https%3A%2F%2Freferer.site
+```
+
+Or generate a token link (XOR+base64url, compatible with the Bun proxy / frontend):
 
 ```sh
 ./fastproxy encode "https://host/master.m3u8" "https://referer.site"
