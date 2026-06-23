@@ -35,14 +35,16 @@ Or generate a token link (XOR+base64url, compatible with the Bun proxy / fronten
 | `UPSTREAM_PROXY_DOMAINS` | _(none)_ | comma list of host suffixes to route via the proxy; empty + proxy set = all |
 | `MAX_CONCURRENT` | `0` | max simultaneous streams (0 = unlimited); excess gets `503` |
 | `INSECURE_TLS` | _(off)_ | `1` to skip upstream cert verification (sketchy CDNs only) |
+| `ALLOW_RAW_URL` | `1` | `0` to disable `?url=` mode and require XOR tokens |
 
 ## What it does
 
-- Decrypts the target URL from the path, forges `Referer`/`Origin`.
-- Rewrites HLS manifests (`.m3u8`) so every segment/key/variant routes back through us.
+- Takes the target from `?url=` (raw-URL mode) or decrypts it from the path, forges `Referer`/`Origin`.
+- Rewrites HLS manifests (`.m3u8`) so every segment/key/variant routes back through us — detected by extension, content-type, or `#EXTM3U` sniffing (extension-less hosts).
 - Streams everything else with bounded RAM (backpressured copy).
-- Rewrites 3xx redirects back through the proxy.
-- Wildcard CORS (no credentials/Vary) + immutable cache headers → CDN-friendly.
+- Follows 3xx redirects server-side (up to 5 hops, SSRF-checked per hop) — no extra client round-trip per segment; POST falls back to a re-wrapped client redirect.
+- Forwards conditional headers (`If-None-Match` etc.) so 304 revalidation works end-to-end.
+- Wildcard CORS (no credentials/Vary) + cache headers tuned per kind: segments immutable-forever, master/VOD playlists 5m browser / 4h edge, live playlists ~2s → CDN-friendly without freezing live streams.
 
 ## Scaling
 
