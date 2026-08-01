@@ -20,14 +20,23 @@ func xorWithSecret(data []byte, secret string) {
 	}
 }
 
-// EncodePayload turns (targetURL, referer) into a path-safe token.
-// Layout before XOR:  <targetURL bytes> 0x00 <referer bytes>
-// The 0x00 is a separator so Decode knows where the URL ends and referer begins.
-func EncodePayload(targetURL, referer string) string {
-	payload := make([]byte, len(targetURL)+1+len(referer))
-	copy(payload, targetURL)                  // [0 .. len(url))      = url
-	payload[len(targetURL)] = 0x00            // [len(url)]           = separator
-	copy(payload[len(targetURL)+1:], referer) // [len(url)+1 ..]   = referer
+// EncodePayload turns (targetURL, referer, server) into a path-safe token.
+// Layout before XOR:  <targetURL> 0x00 <referer> 0x00 <server>
+//
+// The third field is the PROVIDER KEY the API resolved this URL from ("uwu",
+// "kiwi", "wave", …). It is what picks the upstream Origin/Referer, because the
+// provider is stable while its CDN hostnames rotate constantly. It is optional:
+// a token from an older API build has only two fields and still decodes, we just
+// fall back to matching on the CDN hostname (see domains.go).
+func EncodePayload(targetURL, referer, server string) string {
+	payload := make([]byte, 0, len(targetURL)+len(referer)+len(server)+2)
+	payload = append(payload, targetURL...)
+	payload = append(payload, 0x00)
+	payload = append(payload, referer...)
+	if server != "" {
+		payload = append(payload, 0x00)
+		payload = append(payload, server...)
+	}
 	xorWithSecret(payload, secretKey)
 	// RawURLEncoding = base64url WITHOUT '=' padding — safe inside a URL path and
 	// byte-for-byte compatible with JS Buffer.toString("base64url").
@@ -35,24 +44,32 @@ func EncodePayload(targetURL, referer string) string {
 }
 
 // DecodePayload reverses EncodePayload. ok=false means the token was malformed.
-func DecodePayload(token string) (targetURL, referer string, ok bool) {
+func DecodePayload(token string) (targetURL, referer, server string, ok bool) {
 	data, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil {
-		return "", "", false
+		return "", "", "", false
 	}
 	xorWithSecret(data, secretKey) // same call undoes the XOR
 
-	// Find the 0x00 separator.
-	sep := -1
-	for i, b := range data {
-		if b == 0x00 {
-			sep = i
-			break
+	sep := indexZero(data, 0)
+	if sep == -1 {
+		// No separator → whole thing is the URL, no referer, no server.
+		return string(data), "", "", true
+	}
+	targetURL = string(data[:sep])
+
+	rest := data[sep+1:]
+	if sep2 := indexZero(rest, 0); sep2 != -1 {
+		return targetURL, string(rest[:sep2]), string(rest[sep2+1:]), true
+	}
+	return targetURL, string(rest), "", true
+}
+
+func indexZero(data []byte, from int) int {
+	for i := from; i < len(data); i++ {
+		if data[i] == 0x00 {
+			return i
 		}
 	}
-	if sep == -1 {
-		// No separator → whole thing is the URL, no referer.
-		return string(data), "", true
-	}
-	return string(data[:sep]), string(data[sep+1:]), true
+	return -1
 }
