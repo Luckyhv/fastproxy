@@ -130,6 +130,7 @@ func setCORS(h http.Header) {
 var cacheableExt = map[string]bool{
 	"ts": true, "m4s": true, "mp4": true, "m4v": true, "mov": true, "webm": true,
 	"m4a": true, "mp3": true, "aac": true, "vtt": true, "key": true,
+	"xls": true,
 	"jpg": true, "jpeg": true, "png": true, "webp": true, "gif": true,
 }
 
@@ -154,6 +155,33 @@ func isCacheableContentType(ct string) bool {
 		strings.Contains(ct, "mp2t") || // .ts segments
 		strings.Contains(ct, "octet-stream") ||
 		strings.Contains(ct, "vtt") // subtitles
+}
+
+// mpegTSContentType returns "video/mp2t" when the sniffed opening bytes are an
+// MPEG-TS packet but the upstream declared something that clearly isn't video.
+// 0x47 is the TS sync byte, at the head of every 188-byte packet. Returns "" to
+// mean "leave the declared type alone" — we only correct a type we know is
+// wrong, never one that's merely unfamiliar.
+func mpegTSContentType(sniffed []byte, declared string) string {
+	if len(sniffed) == 0 || sniffed[0] != 0x47 {
+		return ""
+	}
+	d := strings.ToLower(declared)
+	if strings.HasPrefix(d, "video/") || strings.HasPrefix(d, "audio/") {
+		return "" // already a media type; trust it
+	}
+	return "video/mp2t"
+}
+
+func responseContentType(host, path string, h http.Header) string {
+	ct := h.Get("Content-Type")
+	lowerHost := strings.ToLower(host)
+	lowerPath := strings.ToLower(path)
+	if strings.HasSuffix(lowerPath, ".xls") &&
+		(lowerHost == "hls.anidb.app" || strings.HasSuffix(lowerHost, ".anidb.app")) {
+		return "video/mp2t"
+	}
+	return ct
 }
 
 // Cache policies. We set THREE headers so each layer obeys independently:
