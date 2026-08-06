@@ -11,9 +11,13 @@ import (
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 )
+
+// isPublicHostFn is the SSRF hostname check, behind a package-level var purely
+// so benchmarks can point the proxy at a loopback origin. Unexported and never
+// reassigned outside tests — production always runs isPublicHost.
+var isPublicHostFn = isPublicHost
 
 // isPublicHost is the cheap, no-DNS SSRF check on the target hostname: reject
 // "localhost" and literal private/loopback IPs outright for a clean 403. Real
@@ -29,16 +33,45 @@ func isPublicHost(host string) bool {
 	return true // hostname — dialControl validates the resolved IP
 }
 
-// bufPool hands out 1 MB scratch buffers and takes them back when a stream ends,
-// so we don't allocate (and then garbage-collect) a fresh buffer for every
-// request. Buffer size is a knob: smaller = less RAM per concurrent stream (more
-// viewers per box), larger = fewer read/write syscalls (more throughput per big
-// file). 1 MB favors throughput; autoTune()'s perStreamBudget is sized to match.
+// streamBufSize is the scratch buffer handed to each in-flight stream, and the
+// single biggest memory term on the box: it is charged per concurrent viewer.
+//
+// Set to 512 KiB by preference. Note for whoever tunes this next — the benchmarks
+// in perf_test.go say the size does NOT buy speed:
+//
+//	BenchmarkBufferSizeSweep (CDN-like load) is flat from 32 KiB to 1 MiB
+//	(1871-1918 MB/s) because the limit is the network, not syscall count, while
+//	memory rises straight-line: 646 KiB/viewer at 32 KiB, 2242 KiB at 1 MiB.
+//	BenchmarkSingleStreamCeiling puts the knee at 64 KiB — it matches 1 MiB even
+//	where syscalls dominate (4053 vs 4153 MB/s), while 32 KiB drops 22%.
+//
+// Time-to-first-byte is unaffected either way: io.CopyBuffer writes whatever a
+// single Read returns, so it never waits to fill the buffer.
+//
+// What the size DOES change is how many viewers fit in RAM — keep
+// perStreamBudget in tune.go in step with it, or autoTune will over-admit.
+//
+// It is a var only so benchmarks can sweep it.
+var streamBufSize = 512 * 1024
+
+// bufPool hands out scratch buffers and takes them back when a stream ends, so
+// we don't allocate (and then garbage-collect) a fresh one per request.
 var bufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 1024*1024) // 1 MB
+		b := make([]byte, streamBufSize)
 		return &b
 	},
+}
+
+// getBuf borrows a buffer, discarding any pooled one that predates a benchmark's
+// size change.
+func getBuf() *[]byte {
+	b := bufPool.Get().(*[]byte)
+	if len(*b) != streamBufSize {
+		nb := make([]byte, streamBufSize)
+		return &nb
+	}
+	return b
 }
 
 // headersToForward are the upstream response headers we pass through to the
@@ -63,15 +96,6 @@ var allowRawURL = getenv("ALLOW_RAW_URL", "1") != "0"
 type readerCloser struct {
 	io.Reader
 	io.Closer
-}
-
-// isSniffableContentType: content-types vague enough that the body might really
-// be an HLS playlist. video/audio/image types are definitely not manifests.
-func isSniffableContentType(ct string) bool {
-	ct = strings.ToLower(ct)
-	return ct == "" ||
-		strings.HasPrefix(ct, "text/plain") ||
-		strings.HasPrefix(ct, "application/octet-stream")
 }
 
 // knownRoutes are the path prefixes the player will hit. The encrypted token is
@@ -108,7 +132,26 @@ const maxManifestSize = 10 << 20 // 10 MiB
 // serveManifest reads the (small) playlist fully, rewrites its child URLs back
 // through us, and writes the result. Unlike the streaming path this DOES buffer
 // the whole body — but only up to maxManifestSize, and only for manifests.
-func serveManifest(w http.ResponseWriter, resp *http.Response, base *url.URL, referer string) {
+func proxyBaseURL(r *http.Request) string {
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	if xf := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); xf == "http" || xf == "https" {
+		scheme = xf
+	}
+	return scheme + "://" + r.Host
+}
+
+func proxyURLFor(r *http.Request, targetURL, referer, server string) string {
+	route := "stream"
+	if parsed, err := url.Parse(targetURL); err == nil && isM3U8URL(parsed) {
+		route = "m3u8"
+	}
+	return proxyBaseURL(r) + "/" + route + "/" + EncodePayload(targetURL, referer, server)
+}
+
+func serveManifest(w http.ResponseWriter, r *http.Request, resp *http.Response, base *url.URL, referer, server string) {
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize))
 	if err != nil {
 		http.Error(w, "manifest read failed", http.StatusBadGateway)
@@ -116,21 +159,29 @@ func serveManifest(w http.ResponseWriter, resp *http.Response, base *url.URL, re
 	}
 
 	// Guard: if it doesn't actually start with #EXTM3U, it was mislabeled — pass
-	// it through untouched rather than corrupting it.
+	// it through untouched rather than corrupting it. We only buffered the first
+	// maxManifestSize bytes, so stream whatever is left instead of silently
+	// serving a truncated file (a big asset behind a .m3u8 URL would otherwise
+	// arrive cut off at exactly 10 MiB, with a 200).
 	if !bytes.HasPrefix(bytes.TrimSpace(body), []byte("#EXTM3U")) {
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
 			w.Header().Set("Content-Type", ct)
 		}
+		setCC(w.Header(), noStore) // not a playlist and not a known asset — don't pin it
 		w.WriteHeader(resp.StatusCode)
-		nw, _ := w.Write(body)
-		atomic.AddInt64(&mBytesDown, int64(nw))
+		if _, err := w.Write(body); err == nil && len(body) == maxManifestSize {
+			buf := getBuf()
+			defer bufPool.Put(buf)
+			_, _ = io.CopyBuffer(w, resp.Body, *buf)
+		}
 		return
 	}
 
-	// encode closes over `referer` so every child URL we emit carries the same
-	// referer — segments need to forge it just like the manifest did.
-	encode := func(u *url.URL) string {
-		return "/stream/" + EncodePayload(u.String(), referer)
+	// encode closes over `referer` and `server` so every child URL we emit carries
+	// the same identity — segments and keys have to forge the origin exactly like
+	// the manifest did, and they inherit it from here.
+	encode := func(uri string) string {
+		return proxyURLFor(r, uri, referer, server)
 	}
 	rewritten := rewritePlaylist(body, base, encode)
 
@@ -151,8 +202,7 @@ func serveManifest(w http.ResponseWriter, resp *http.Response, base *url.URL, re
 		setCC(h, livePolicy)
 	}
 	w.WriteHeader(resp.StatusCode)
-	nw, _ := w.Write(rewritten)
-	atomic.AddInt64(&mBytesDown, int64(nw))
+	_, _ = w.Write(rewritten)
 }
 
 // inFlight optionally caps how many streams we serve at once. Backpressure
@@ -168,56 +218,49 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		case inFlight <- struct{}{}: // got a slot
 			defer func() { <-inFlight }()
 		default:
-			atomic.AddInt64(&mBusy, 1)
 			http.Error(w, "server busy", http.StatusServiceUnavailable)
 			return
 		}
 	}
 
-	// Count this as an accepted request and track it as in-flight for the whole
-	// proxied lifetime (released when the handler returns).
-	atomic.AddInt64(&mTotalReq, 1)
-	atomic.AddInt64(&mActive, 1)
-	defer atomic.AddInt64(&mActive, -1)
-
 	// 1. Resolve the target. Two ways in:
-	//    a) plain-URL mode: /stream?url=<absolute-url>&ref=<referer> — the easy
+	//    a) plain-URL mode: /stream?url=<absolute-url>&ref=<referer>&sv=<server> — the easy
 	//       way to proxy any HLS stream. Disable with ALLOW_RAW_URL=0 if you only
 	//       want tokenized (key-tied) access.
 	//    b) token mode: /stream/<encrypted-payload> (what the frontend generates).
-	var rawURL, referer string
+	var rawURL, referer, server string
 	if q := r.URL.Query(); allowRawURL && q.Get("url") != "" {
 		rawURL = q.Get("url")
 		referer = q.Get("ref")
 		if referer == "" {
 			referer = q.Get("referer")
 		}
+		server = q.Get("sv")
+		if server == "" {
+			server = q.Get("server")
+		}
 	} else {
 		token := extractPayload(r.URL.Path)
 		if token == "" {
-			atomic.AddInt64(&mRejected, 1)
 			http.Error(w, "missing payload", http.StatusBadRequest)
 			return
 		}
 		var ok bool
-		rawURL, referer, ok = DecodePayload(token)
+		rawURL, referer, server, ok = DecodePayload(token)
 		if !ok {
-			atomic.AddInt64(&mRejected, 1)
 			http.Error(w, "invalid payload", http.StatusBadRequest)
 			return
 		}
 	}
 	target, err := url.Parse(rawURL)
 	if err != nil || (target.Scheme != "http" && target.Scheme != "https") {
-		atomic.AddInt64(&mRejected, 1)
 		http.Error(w, "bad url", http.StatusBadRequest)
 		return
 	}
 	// SSRF guard: refuse targets that resolve to loopback/private/link-local
 	// space, so a forged token can't make us fetch internal services or cloud
 	// metadata (169.254.169.254). External video CDNs are always public IPs.
-	if !isPublicHost(target.Hostname()) {
-		atomic.AddInt64(&mRejected, 1)
+	if !isPublicHostFn(target.Hostname()) {
 		http.Error(w, "forbidden target", http.StatusForbidden)
 		return
 	}
@@ -237,7 +280,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if r.Method == http.MethodHead {
 		upstreamMethod = http.MethodGet
 	}
-	req, err := http.NewRequestWithContext(r.Context(), upstreamMethod, target.String(), reqBody)
+	ctx := context.WithValue(r.Context(), proxyServerKey{}, strings.ToLower(strings.TrimSpace(server)))
+	req, err := http.NewRequestWithContext(ctx, upstreamMethod, target.String(), reqBody)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusInternalServerError)
 		return
@@ -260,24 +304,18 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set(k, v)
 		}
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0")
+	// Many video hosts only serve bytes when the request both LOOKS like a browser
+	// and claims to come from their own player page. applyUpstreamHeaders stamps
+	// the browser-shaped baseline and the Origin/Referer this provider demands
+	// (see domains.go), and tells us whether it also refuses HTTP/1.1.
+	useHTTP2 := applyUpstreamHeaders(req, target, referer, server)
+	// Never let upstream gzip video bytes; set last so nothing above overrides it.
 	req.Header.Set("Accept-Encoding", "identity")
-
-	// Many video hosts only serve bytes when the request looks like it came from
-	// their own player page. The referer baked into the payload is how we forge
-	// that origin. We derive Origin from it too (scheme://host, no path).
-	if referer != "" {
-		req.Header.Set("Referer", referer)
-		if ref, err := url.Parse(referer); err == nil {
-			req.Header.Set("Origin", ref.Scheme+"://"+ref.Host)
-		}
-	}
 
 	// 4. Fire the upstream fetch. resp.Body is a STREAM, not the full payload —
 	//    nothing has been downloaded into memory yet at this line.
-	resp, err := httpClient.Do(req)
+	resp, err := doUpstream(req, useHTTP2)
 	if err != nil {
-		atomic.AddInt64(&mUpstreamErr, 1)
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
 	}
@@ -291,33 +329,32 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		if loc == "" {
 			break
 		}
-		atomic.AddInt64(&mRedirects, 1)
 		abs := resolve(loc, target)
 		resp.Body.Close() // release the redirect response's connection
-		if (abs.Scheme != "http" && abs.Scheme != "https") || !isPublicHost(abs.Hostname()) {
-			atomic.AddInt64(&mRejected, 1)
+		if (abs.Scheme != "http" && abs.Scheme != "https") || !isPublicHostFn(abs.Hostname()) {
 			http.Error(w, "forbidden redirect target", http.StatusForbidden)
 			return
 		}
 		target = abs
-		nreq, nerr := http.NewRequestWithContext(r.Context(), upstreamMethod, target.String(), nil)
+		nreq, nerr := http.NewRequestWithContext(ctx, upstreamMethod, target.String(), nil)
 		if nerr != nil {
 			http.Error(w, "bad redirect", http.StatusBadGateway)
 			return
 		}
-		nreq.Header = req.Header // same forged headers on every hop
+		nreq.Header = req.Header.Clone() // carry Range / conditionals across the hop
+		// A hop can land on a different CDN with a different player-origin (and
+		// HTTP-version) requirement, so re-resolve rather than replaying the
+		// previous host's identity.
+		useHTTP2 = applyUpstreamHeaders(nreq, target, referer, server)
+		nreq.Header.Set("Accept-Encoding", "identity")
 		req = nreq
-		resp, err = httpClient.Do(req)
+		resp, err = doUpstream(req, useHTTP2)
 		if err != nil {
-			atomic.AddInt64(&mUpstreamErr, 1)
 			http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 			return
 		}
 	}
 
-	// Count every byte we pull from the origin (ingress). Wrapping here covers
-	// both the streaming copy and the manifest read below.
-	resp.Body = &countingReadCloser{rc: resp.Body, n: &mBytesUp}
 	defer resp.Body.Close() // always release the upstream connection
 
 	// Still 3xx (POST, redirect loop, or missing Location)? Re-wrap the Location
@@ -325,7 +362,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		if loc := resp.Header.Get("Location"); loc != "" {
 			abs := resolve(loc, target)
-			http.Redirect(w, r, "/stream/"+EncodePayload(abs.String(), referer), resp.StatusCode)
+			http.Redirect(w, r, proxyURLFor(r, abs.String(), referer, server), resp.StatusCode)
 			return
 		}
 	}
@@ -336,17 +373,24 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//     when both are ambiguous (extension-less URL + text/octet-stream
 	//     content-type, common on shady hosts) sniff the first bytes for #EXTM3U.
 	ct := resp.Header.Get("Content-Type")
-	isManifest := isM3U8Path(target.Path) || isM3U8ContentType(ct)
-	if !isManifest && resp.StatusCode == http.StatusOK && isSniffableContentType(ct) && !isCacheableAsset(target.Path) {
+	isManifest := isM3U8URL(target) || isM3U8ContentType(ct)
+	// Sniff whenever the URL gives us no usable extension. We deliberately do NOT
+	// gate on content-type here: the wave CDN serves its master playlist as
+	// `image/jpeg` from an extension-less path, so trusting either signal alone
+	// streams the playlist through raw — child URLs never rewritten, and the
+	// player gets an "image" it can't parse. The peek is 7 bytes and is stitched
+	// straight back onto the stream, so it costs nothing when we're wrong.
+	var sniffed []byte
+	if !isManifest && resp.StatusCode == http.StatusOK && r.Method != http.MethodHead && !isCacheableAsset(target.Path) {
 		peek := make([]byte, len("#EXTM3U"))
 		n, _ := io.ReadFull(resp.Body, peek)
 		// Stitch the peeked bytes back in front of the remaining stream.
 		resp.Body = readerCloser{io.MultiReader(bytes.NewReader(peek[:n]), resp.Body), resp.Body}
-		isManifest = string(peek[:n]) == "#EXTM3U"
+		sniffed = peek[:n]
+		isManifest = string(sniffed) == "#EXTM3U"
 	}
 	if isManifest {
-		atomic.AddInt64(&mManifests, 1)
-		serveManifest(w, resp, target, referer)
+		serveManifest(w, r, resp, target, referer, server)
 		return
 	}
 
@@ -358,7 +402,18 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			out.Set(k, v)
 		}
 	}
-	setAssetCache(out, target.Path, resp.StatusCode, resp.Header.Get("Content-Type"))
+	ct = responseContentType(target.Hostname(), target.Path, resp.Header)
+	// We already have this segment's first bytes from the manifest sniff above, so
+	// correcting a mislabeled type is free: wave serves MPEG-TS segments as
+	// `image/jpeg`. hls.js goes by the manifest and doesn't care, but Safari's
+	// native player does, and an "image" content-type also confuses caches.
+	if tsCT := mpegTSContentType(sniffed, ct); tsCT != "" {
+		ct = tsCT
+	}
+	if ct != "" {
+		out.Set("Content-Type", ct)
+	}
+	setAssetCache(out, target.Path, resp.StatusCode, ct)
 
 	// 6. Send the upstream status line (200 full body, 206 for a Range).
 	w.WriteHeader(resp.StatusCode)
@@ -374,10 +429,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//    has room. A slow viewer therefore slows our reads from upstream, so at
 	//    most ~one buffer is in flight per connection — RAM stays bounded (flat)
 	//    no matter how slow the client, instead of buffering the whole file.
-	buf := bufPool.Get().(*[]byte)
+	buf := getBuf()
 	defer bufPool.Put(buf)
-	n, err := io.CopyBuffer(w, resp.Body, *buf)
-	atomic.AddInt64(&mBytesDown, n) // bytes delivered to client (egress)
+	_, err = io.CopyBuffer(w, resp.Body, *buf)
 	if err != nil && !isClientGone(err) {
 		// Only log genuine failures — client disconnects (seek/close) are normal
 		// for video and would otherwise spam the log on every interaction.

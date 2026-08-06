@@ -19,6 +19,13 @@ func isM3U8Path(p string) bool {
 	return strings.HasSuffix(p, ".m3u8") || strings.HasSuffix(p, ".m3u")
 }
 
+// isM3U8URL also looks at the query string. Some hosts park the extension there
+// instead of on the path — wave hands out `/cdn/<hash>?t.m3u8`, where the path
+// alone looks like an opaque blob.
+func isM3U8URL(u *url.URL) bool {
+	return isM3U8Path(u.Path) || isM3U8Path(u.RawQuery)
+}
+
 // resolve turns a (possibly relative) URI from inside a manifest into an
 // absolute URL, using the manifest's own URL as the base. ResolveReference does
 // the right thing for both: if ref is already absolute it's returned as-is;
@@ -31,29 +38,72 @@ func resolve(ref string, base *url.URL) *url.URL {
 	return base.ResolveReference(u)
 }
 
-// rewritePlaylist walks an HLS manifest line by line and rewrites every child
-// URL so the player fetches it back through us. `encode` maps an absolute
-// upstream URL to a local proxy path (with the referer baked in).
-func rewritePlaylist(body []byte, base *url.URL, encode func(*url.URL) string) []byte {
-	lines := bytes.Split(body, []byte("\n"))
-	var out bytes.Buffer
-	out.Grow(len(body) * 2) // rewritten URLs are longer; pre-grow to avoid reallocs
+// isAbsoluteHTTP reports whether a playlist URI is already an absolute http(s)
+// URL, without parsing it.
+func isAbsoluteHTTP(ref string) bool {
+	if len(ref) >= 7 && (ref[4] == ':' || ref[5] == ':') {
+		return strings.HasPrefix(ref, "http://") || strings.HasPrefix(ref, "https://")
+	}
+	return false
+}
 
-	for i, line := range lines {
+// absoluteURI is resolve() specialised for the rewrite loop, where it runs once
+// per playlist line. Most providers emit absolute URLs, and for those a
+// url.Parse + ResolveReference + String() round trip is pure waste — it costs
+// five allocations to hand back (very nearly) the string we started with. Take
+// the raw string instead; handleProxy re-parses and revalidates it on the way
+// back in anyway, so nothing skips a check.
+func absoluteURI(ref string, base *url.URL) string {
+	ref = strings.TrimSpace(ref)
+	if isAbsoluteHTTP(ref) {
+		return ref
+	}
+	return resolve(ref, base).String()
+}
+
+// rewritePlaylist walks an HLS manifest line by line and rewrites every child
+// URL so the player fetches it back through us. `encode` maps an upstream URI
+// (already made absolute) to a local proxy path, with the referer and server
+// baked in.
+//
+// Scans the body in place rather than bytes.Split-ing it: a 1200-segment
+// playlist is ~2400 lines, and we would otherwise allocate a slice header for
+// every one of them before writing a single byte.
+func rewritePlaylist(body []byte, base *url.URL, encode func(string) string) []byte {
+	var out bytes.Buffer
+	// Proxy paths are base64 of (url + referer + server), so a rewritten line
+	// runs ~1.4x its source plus the /stream/ prefix. 2x covers it without a
+	// realloc on any real playlist.
+	out.Grow(len(body) * 2)
+
+	// Mirrors bytes.Split exactly: a body ending in "\n" has a final empty line,
+	// so the trailing newline survives the round trip. Driving the loop off
+	// len(body) instead would silently eat it.
+	for i := 0; ; i++ {
 		if i > 0 {
-			out.WriteByte('\n') // restore the newline Split removed
+			out.WriteByte('\n') // restore the newline the split removed
 		}
-		s := string(bytes.TrimRight(line, "\r")) // tolerate Windows CRLF endings
+		var line []byte
+		nl := bytes.IndexByte(body, '\n')
+		if nl >= 0 {
+			line, body = body[:nl], body[nl+1:]
+		} else {
+			line, body = body, nil
+		}
+		line = bytes.TrimRight(line, "\r") // tolerate Windows CRLF endings
 
 		switch {
-		case len(s) == 0:
+		case len(line) == 0:
 			// blank line — keep as-is
-		case s[0] == '#':
+		case line[0] == '#':
 			// a tag line. Most pass through untouched; a few embed a URI="...".
-			out.WriteString(rewriteTagLine(s, base, encode))
+			out.WriteString(rewriteTagLine(string(line), base, encode))
 		default:
 			// a bare URL line: a segment (.ts/.m4s) or a variant playlist (.m3u8)
-			out.WriteString(encode(resolve(s, base)))
+			out.WriteString(encode(absoluteURI(string(line), base)))
+		}
+		if nl < 0 {
+			break // that was the last line
 		}
 	}
 	return out.Bytes()
@@ -63,7 +113,7 @@ func rewritePlaylist(body []byte, base *url.URL, encode func(*url.URL) string) [
 // like #EXT-X-KEY (decryption key), #EXT-X-MAP (init segment), #EXT-X-MEDIA
 // (alternate audio/subtitle renditions) and #EXT-X-I-FRAME-STREAM-INF all point
 // at child resources that must also go through us.
-func rewriteTagLine(line string, base *url.URL, encode func(*url.URL) string) string {
+func rewriteTagLine(line string, base *url.URL, encode func(string) string) string {
 	const marker = `URI="`
 	if !strings.Contains(line, marker) {
 		return line // fast path: no URI to rewrite
@@ -85,10 +135,10 @@ func rewriteTagLine(line string, base *url.URL, encode func(*url.URL) string) st
 		}
 		end += start
 
-		b.WriteString(line[i:start])                          // everything up to & incl. URI="
-		b.WriteString(encode(resolve(line[start:end], base))) // rewritten value
-		b.WriteByte('"')                                      // closing quote
-		i = end + 1                                           // continue after it
+		b.WriteString(line[i:start])                              // everything up to & incl. URI="
+		b.WriteString(encode(absoluteURI(line[start:end], base))) // rewritten value
+		b.WriteByte('"')                                          // closing quote
+		i = end + 1                                               // continue after it
 	}
 	return b.String()
 }

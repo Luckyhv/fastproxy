@@ -10,11 +10,16 @@ import (
 )
 
 // perStreamBudget is the RAM we conservatively reserve per concurrent stream when
-// auto-deriving MAX_CONCURRENT. The live copy buffer is 1 MB (see bufPool), plus
-// net/http read/write buffers, TLS state, and the upstream side — so we budget
-// ~1.5 MB to stay safe under real traffic. Bigger buffer = fewer concurrent
-// streams auto-allowed, which is correct.
-const perStreamBudget = 1536 * 1024
+// auto-deriving MAX_CONCURRENT: the copy buffer (see streamBufSize), the
+// per-connection transport buffers on both sides, and TLS state.
+//
+// This MUST track streamBufSize. With the 512 KiB copy buffer and 64/8 KiB
+// upstream transport buffers, 2 MiB per viewer is a conservative admission
+// budget with headroom for TLS/socket/runtime overhead.
+//
+// If streamBufSize ever drops to 64 KiB, this can drop to ~768 KiB (measured
+// 622 KiB/viewer), roughly tripling the viewers a given box will accept.
+const perStreamBudget = 2048 * 1024
 
 // autoTune inspects the machine/container and picks sane runtime defaults,
 // logging what it found. Explicit env vars (GOMAXPROCS, MAX_CONCURRENT) always

@@ -9,19 +9,23 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
 func main() {
-	// Dev helper:  `fastproxy encode <url> [referer]`  prints a path token you can
-	// paste after /stream/ to test. Not part of the server path.
+	// Dev helper:  `fastproxy encode <url> [referer] [server]`  prints a path token
+	// you can paste after /stream/ to test. Not part of the server path.
 	if len(os.Args) > 1 && os.Args[1] == "encode" {
-		ref := ""
+		ref, server := "", ""
 		if len(os.Args) > 3 {
 			ref = os.Args[3]
 		}
-		fmt.Println(EncodePayload(os.Args[2], ref))
+		if len(os.Args) > 4 {
+			server = os.Args[4]
+		}
+		fmt.Println(EncodePayload(os.Args[2], ref, server))
 		return
 	}
 
@@ -33,17 +37,20 @@ func main() {
 	} else {
 		log.Printf("origin allow-list: OPEN — set ALLOWED_ORIGINS to restrict")
 	}
+	if upstreamProxyPool.len() > 0 {
+		log.Printf("upstream proxy pool active: %d proxies, servers=%v domains=%v, cooldowns rate=%s error=%s 5xx=%s",
+			upstreamProxyPool.len(), upstreamProxyServers, upstreamProxyDomains,
+			proxyRatePenalty, proxyErrorPenalty, proxyServerPenalty)
+	} else {
+		log.Printf("upstream proxy pool: disabled")
+	}
 
 	// BIND_ADDR lets you restrict the listen interface. Behind a reverse proxy
 	// (Caddy/nginx) on the same box, set BIND_ADDR=127.0.0.1 so the proxy is not
 	// reachable from the public internet directly. Empty = all interfaces.
 	addr := getenv("BIND_ADDR", "") + ":" + getenv("PORT", "3847")
 
-	// Route the metrics endpoints separately; everything else is the proxy.
-	// /stats and /dashboard are gated by STATS_TOKEN (404 when unset/wrong).
 	mux := http.NewServeMux()
-	mux.HandleFunc("/stats", statsHandler)
-	mux.HandleFunc("/dashboard", dashboardHandler)
 	mux.Handle("/", withCORS(handleProxy))
 
 	srv := &http.Server{
@@ -87,6 +94,22 @@ func getenv(k, def string) string {
 	ensureEnv() // load .env once, before the first config read
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+// getenvDuration reads a duration knob. Accepts a Go duration ("90s", "5m") or
+// a bare number of seconds; anything unparseable falls back to def.
+func getenvDuration(k string, def time.Duration) time.Duration {
+	v := strings.TrimSpace(getenv(k, ""))
+	if v == "" {
+		return def
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return d
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return time.Duration(n) * time.Second
 	}
 	return def
 }
