@@ -5,22 +5,30 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
-Group=root
-WorkingDirectory=/root/projects/fastproxy
-ExecStart=/root/projects/fastproxy/fastproxy
+User=fastproxy
+Group=fastproxy
+EnvironmentFile=/etc/fastproxy/fastproxy.env
+WorkingDirectory=/opt/fastproxy
+ExecStart=/opt/fastproxy/fastproxy
 Restart=always
-RestartSec=2
+RestartSec=1
 
 # Each live stream is a file descriptor — lift the default 1024 ceiling so the
 # box can fan out to many concurrent viewers.
 LimitNOFILE=1048576
+TasksMax=infinity
 
 # Basic hardening.
 NoNewPrivileges=true
 ProtectSystem=full
-ProtectHome=false
+ProtectHome=true
+PrivateDevices=true
 PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
 
 [Install]
 WantedBy=multi-user.target
