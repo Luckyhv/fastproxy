@@ -7,7 +7,7 @@ import "encoding/base64"
 // readable/guessable in the path and ties payloads to your key, but it is not a
 // security boundary. We keep this scheme only because your frontend + Bun proxy
 // already generate payloads this exact way, so they stay compatible.
-var secretKey = getenv("SECRET_KEY", "aproxy2026")
+var secretKey = getenv("SECRET_KEY", "dj5D455Lzl2LKJXEtFwb5gy2oGFSYPnBKp7PTgFPm6Gn2MGb")
 
 // xorWithSecret flips each byte against the repeating key, in place. XOR is its
 // own inverse, so the SAME function both encodes and decodes.
