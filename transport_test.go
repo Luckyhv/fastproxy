@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -391,5 +392,106 @@ func TestRotatingProxyColdConnectionsScaleWithPool(t *testing.T) {
 			t.Fatalf("pool of %d over %d requests opened %d connections, want %d",
 				size, requests, got, want)
 		}
+	}
+}
+
+// ─── Throttle fallback ───────────────────────────────────────────────────────
+
+// A host that throttles our direct egress IP must be retried through the pool,
+// even when it was never listed in UPSTREAM_PROXY_SERVERS. This is the neko case
+// (Aug 2026): a Cloudflare Worker started answering 429 to the single VPS IP
+// while a thousand idle exits went unused, because upstreamAttempts returns 1
+// for unproxied hosts and there was no escape path.
+func TestThrottledHostFallsBackToProxy(t *testing.T) {
+	var viaProxy atomic.Int64
+
+	// Upstream answers 429 to a direct hit and 200 once the request arrives
+	// through the forward proxy below.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Through-Proxy") == "" {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte("rate limited"))
+			return
+		}
+		viaProxy.Add(1)
+		_, _ = w.Write([]byte("#EXTM3U\n"))
+	}))
+	defer origin.Close()
+
+	forward := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		out, err := http.NewRequest(r.Method, r.URL.String(), nil)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		out.Header.Set("X-Through-Proxy", "1")
+		resp, err := http.DefaultClient.Do(out)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer forward.Close()
+
+	// Same seam the benchmarks use: dialControl is the SSRF backstop and refuses
+	// loopback, so swap in a plain dialer to reach the httptest servers.
+	savedTransport := httpClient.Transport
+	tr := savedTransport.(*http.Transport).Clone()
+	tr.DialContext = (&net.Dialer{Timeout: 10 * time.Second}).DialContext
+	httpClient.Transport = tr
+
+	oldPool, oldServers := upstreamProxyPool, upstreamProxyServers
+	defer func() {
+		upstreamProxyPool, upstreamProxyServers = oldPool, oldServers
+		httpClient.Transport = savedTransport
+		throttledHosts = sync.Map{}
+	}()
+	upstreamProxyPool = newProxyPool([]string{forward.URL})
+	upstreamProxyServers = nil // deliberately NOT configured for this host
+	throttledHosts = sync.Map{}
+
+	req, err := http.NewRequest(http.MethodGet, origin.URL+"/index.m3u8", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shouldProxyRequest(req) {
+		t.Fatal("host should start out unproxied")
+	}
+
+	resp, err := doUpstream(req, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("throttled fetch returned %d, want 200 via the pool", resp.StatusCode)
+	}
+	if viaProxy.Load() != 1 {
+		t.Fatalf("upstream saw %d proxied requests, want 1", viaProxy.Load())
+	}
+
+	// And the host must be remembered, so the next segment goes through the pool
+	// up front instead of eating another 429 first.
+	if !shouldProxyRequest(req) {
+		t.Fatal("throttled host was not remembered")
+	}
+}
+
+// The memory must expire, so we drift back to the faster direct path.
+func TestThrottleMemoryExpires(t *testing.T) {
+	old := throttleMemory
+	defer func() { throttleMemory = old; throttledHosts = sync.Map{} }()
+	throttleMemory = 20 * time.Millisecond
+
+	markThrottled("cdn.example")
+	if !hostThrottled("CDN.Example") { // case-insensitive
+		t.Fatal("host should be throttled immediately after marking")
+	}
+	time.Sleep(35 * time.Millisecond)
+	if hostThrottled("cdn.example") {
+		t.Fatal("throttle memory did not expire")
 	}
 }

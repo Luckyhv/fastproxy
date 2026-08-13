@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -370,8 +371,51 @@ func shouldProxyRequest(req *http.Request) bool {
 		nameListed(server, upstreamProxyServers) {
 		return true
 	}
+	// A host that recently throttled our egress IP routes through the pool even
+	// if it was never configured to, until the memory expires.
+	if hostThrottled(req.URL.Hostname()) {
+		return true
+	}
 	return len(upstreamProxyDomains) > 0 &&
 		hostListed(req.URL.Hostname(), upstreamProxyDomains)
+}
+
+// ─── Throttle memory ─────────────────────────────────────────────────────────
+// A CDN answering 429/403 to a direct fetch is rate-limiting our single egress
+// IP. That is exactly what the proxy pool is for, but until now only hosts named
+// in UPSTREAM_PROXY_SERVERS could reach it — so a provider that started
+// throttling (neko's Cloudflare Worker, Aug 2026) just failed, with a thousand
+// idle exits going unused. Remembering the host means we pay the throttled
+// response once, not on the first attempt of every subsequent segment.
+
+var throttledHosts sync.Map // lowercased host -> expiry, unix nanos
+
+// throttleMemory is deliberately short: these limits are transient, and staying
+// on the proxy costs ~3x the direct latency, so we drift back to direct quickly.
+var throttleMemory = getenvDuration("UPSTREAM_THROTTLE_MEMORY", 10*time.Minute)
+
+func markThrottled(host string) {
+	if host == "" {
+		return
+	}
+	throttledHosts.Store(strings.ToLower(host), time.Now().Add(throttleMemory).UnixNano())
+}
+
+func hostThrottled(host string) bool {
+	if host == "" {
+		return false
+	}
+	key := strings.ToLower(host)
+	v, ok := throttledHosts.Load(key)
+	if !ok {
+		return false
+	}
+	until, _ := v.(int64)
+	if time.Now().UnixNano() < until {
+		return true
+	}
+	throttledHosts.Delete(key)
+	return false
 }
 
 // proxyForRequest decides, per upstream request, whether to route via the egress
@@ -454,10 +498,51 @@ func doUpstream(req *http.Request, useHTTP2 bool) (*http.Response, error) {
 				resp.Body.Close()
 				continue
 			}
+			// Direct fetch got throttled and we have no attempts left because
+			// this host was never configured for the pool. Escape through it.
+			if !proxied {
+				if fallback := proxyFallback(req, useHTTP2); fallback != nil {
+					resp.Body.Close()
+					return fallback, nil
+				}
+			}
 		}
 		return resp, nil
 	}
 	return nil, lastErr
+}
+
+// proxyFallback retries a throttled DIRECT fetch through the egress pool, and
+// remembers the host so later segments go through the pool up front instead of
+// eating a 429 first. Returns nil if the pool can't do better, in which case the
+// caller passes the original throttled response through unchanged.
+//
+// GET/HEAD only: a POST's body was already consumed by the first attempt, so it
+// cannot be replayed.
+func proxyFallback(req *http.Request, useHTTP2 bool) *http.Response {
+	if upstreamProxyPool.len() == 0 || req.Method == http.MethodPost {
+		return nil
+	}
+	markThrottled(req.URL.Hostname())
+
+	proxy := upstreamProxyPool.pickFor(req, 0)
+	client := httpClient
+	if useHTTP2 {
+		client = h2Client
+	}
+	resp, err := client.Do(req.Clone(context.WithValue(req.Context(), forcedProxyKey{}, proxy)))
+	if err != nil {
+		upstreamProxyPool.penalize(proxy, proxyErrorPenalty)
+		return nil
+	}
+	if retryableUpstreamStatus(resp.StatusCode) {
+		// The exit is throttled too — bench it and let the caller surface the
+		// original response rather than this second one.
+		upstreamProxyPool.penalize(proxy, proxyPenaltyFor(resp.StatusCode))
+		resp.Body.Close()
+		return nil
+	}
+	return resp
 }
 
 // httpClient is the ONE client we reuse for every upstream fetch. Sharing a
