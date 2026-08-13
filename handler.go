@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -281,6 +282,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		upstreamMethod = http.MethodGet
 	}
 	ctx := context.WithValue(r.Context(), proxyServerKey{}, strings.ToLower(strings.TrimSpace(server)))
+	// Pin this viewer's stream to one exit IP so its segments reuse a warm
+	// tunnel instead of re-handshaking per segment (see proxyPool.sticky).
+	ctx = context.WithValue(ctx, stickyKeyKey{}, stickyKey(clientIP(r), target.Hostname()))
 	req, err := http.NewRequestWithContext(ctx, upstreamMethod, target.String(), reqBody)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusInternalServerError)
@@ -437,6 +441,38 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		// for video and would otherwise spam the log on every interaction.
 		log.Printf("stream error: %v", err)
 	}
+}
+
+// clientIP is the viewer's address. We sit behind Cloudflare and a local reverse
+// proxy, so RemoteAddr is the last hop, not the viewer — without the forwarded
+// headers every viewer would share one sticky key and therefore one exit IP,
+// which is exactly the per-IP throttling the pool exists to avoid.
+func clientIP(r *http.Request) string {
+	if v := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); v != "" {
+		return v
+	}
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		// Left-most entry is the original client; the rest are proxies.
+		if first, _, found := strings.Cut(v, ","); found {
+			return strings.TrimSpace(first)
+		}
+		return strings.TrimSpace(v)
+	}
+	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
+		return host
+	}
+	return r.RemoteAddr
+}
+
+// stickyKey hashes viewer + upstream host into the pool index. Including the
+// host means one viewer watching from two CDNs gets two exits (so a block on one
+// doesn't follow them), while every segment of a single stream shares one.
+func stickyKey(clientIP, host string) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(clientIP))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(host))
+	return h.Sum64()
 }
 
 // isClientGone reports whether a copy error is just the viewer disconnecting

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -83,12 +84,17 @@ var (
 
 type forcedProxyKey struct{}
 type proxyServerKey struct{}
+type stickyKeyKey struct{}
 
 // proxyEntry is one exit IP plus its cooldown deadline (unix nanos, 0 =
 // healthy). Held by pointer so the atomic is never copied.
 type proxyEntry struct {
 	url         *url.URL
 	bannedUntil atomic.Int64
+
+	// latency is an EWMA of this exit's time-to-response-headers, in nanos.
+	// 0 = never measured, which counts as fast so untried exits get sampled.
+	latency atomic.Int64
 }
 
 type proxyPool struct {
@@ -99,6 +105,16 @@ type proxyPool struct {
 	byURL        map[*url.URL]*proxyEntry
 	cursor       uint64
 	lastDrainLog atomic.Int64
+
+	// fastCutoff is the latency (nanos) at or below which an exit is considered
+	// fast; sticky selection prefers those. 0 = not enough measurements yet, so
+	// the whole pool is selectable.
+	fastCutoff     atomic.Int64
+	lastCutoffCalc atomic.Int64
+	// measuredCount is how many entries have a latency sample, so refreshCutoff
+	// can cheaply tell "not enough signal yet" without scanning the pool on
+	// every single request.
+	measuredCount atomic.Int64
 }
 
 func proxyEnv() []string {
@@ -236,6 +252,177 @@ func (p *proxyPool) next() *url.URL {
 	return soonest.url
 }
 
+// sticky picks a proxy deterministically from `key`, returning the attempt'th
+// HEALTHY entry at or after that starting point.
+//
+// This is the counterpart to next(), and the reason it exists is connection
+// reuse. Go's Transport keys its idle keep-alive pool on the proxy URL, so
+// handing out a different proxy per request guarantees a pool miss: every HLS
+// segment then pays a fresh TCP connect + CONNECT tunnel + TLS handshake to the
+// CDN (measured at 260-760ms vs 70-155ms on a warm tunnel). Pinning one exit per
+// viewer-stream lets a whole playback session ride one warm connection, while
+// DIFFERENT viewers still land on different exits — which is what the per-IP
+// rate limits actually care about. Rotation was never buying us anything
+// within a single session; it was only costing handshakes.
+//
+// attempt > 0 walks to the next healthy exit, so doUpstream's retries still
+// escape a bad proxy.
+func (p *proxyPool) sticky(key uint64, attempt int) *url.URL {
+	n := p.len()
+	if n == 0 {
+		return nil
+	}
+	// Prefer exits measured in the fast half of the pool: a 60-exit sample of
+	// proxies.txt spanned 0.37s to 0.99s time-to-first-byte, so which exit a
+	// viewer lands on is worth ~2x. Fall back to the whole healthy set when the
+	// fast half can't serve this attempt.
+	//
+	// One key in every explorerShare skips the fast set, which is what keeps
+	// unmeasured exits earning samples — without it the ranked set could never
+	// grow beyond whatever happened to be measured first.
+	if key%explorerShare != 0 {
+		if u, _ := p.walk(key, attempt, true); u != nil {
+			return u
+		}
+	}
+	u, soonest := p.walk(key, attempt, false)
+	if u != nil {
+		return u
+	}
+	// Every proxy is cooling down — serve from whichever recovers first rather
+	// than failing the fetch outright.
+	p.warnDrained(n)
+	return soonest.url
+}
+
+// walk returns the attempt'th selectable exit at or after key's slot, along with
+// the benched entry closest to recovering (for the drained fallback). Selectable
+// means "not cooling down", and when fastOnly is set, also "not slower than the
+// pool's cutoff". attempt wraps, so a retry past the end of the set comes back
+// round instead of failing.
+func (p *proxyPool) walk(key uint64, attempt int, fastOnly bool) (*url.URL, *proxyEntry) {
+	n := p.len()
+	now := time.Now().UnixNano()
+	start := key % uint64(n)
+	cutoff := int64(0)
+	if fastOnly {
+		cutoff = p.fastCutoff.Load()
+	}
+
+	selectable := func(e *proxyEntry) bool {
+		if e.bannedUntil.Load() > now {
+			return false
+		}
+		if cutoff == 0 {
+			return true
+		}
+		// The fast pass requires a MEASURED exit inside the cutoff. Treating
+		// unmeasured exits as fast (the obvious shortcut) makes steering useless
+		// on a 1000-entry pool: 98% of exits are unranked, so nearly every viewer
+		// finds one before a known-good one and assignment stays a coin flip —
+		// measured at 3.5s-8.4s for the same 30 segments. Unmeasured exits get
+		// their sample from the explorer path below instead.
+		lat := e.latency.Load()
+		return lat > 0 && lat <= cutoff
+	}
+
+	// Count first so `attempt` can wrap without recursing. Both passes are plain
+	// atomic loads — microseconds against a network fetch.
+	count := 0
+	var soonest *proxyEntry
+	var soonestUntil int64
+	for off := 0; off < n; off++ {
+		e := p.entries[int((start+uint64(off))%uint64(n))]
+		if until := e.bannedUntil.Load(); until > now {
+			if soonest == nil || until < soonestUntil {
+				soonest, soonestUntil = e, until
+			}
+			continue
+		}
+		if selectable(e) {
+			count++
+		}
+	}
+	if count == 0 {
+		return nil, soonest
+	}
+
+	want := attempt % count
+	for off := 0; off < n; off++ {
+		e := p.entries[int((start+uint64(off))%uint64(n))]
+		if !selectable(e) {
+			continue
+		}
+		if want == 0 {
+			return e.url, soonest
+		}
+		want--
+	}
+	return nil, soonest
+}
+
+// observe folds a completed fetch's time-to-headers into that exit's EWMA, which
+// is what lets sticky selection steer away from the slow half of the pool.
+func (p *proxyPool) observe(u *url.URL, d time.Duration) {
+	if p == nil || u == nil || d <= 0 {
+		return
+	}
+	e := p.byURL[u]
+	if e == nil {
+		return
+	}
+	next := int64(d)
+	if prev := e.latency.Load(); prev > 0 {
+		// alpha = 1/4: quick enough to notice an exit going bad, damped enough
+		// that one slow segment doesn't evict a good one.
+		next = (prev*3 + next) / 4
+	} else {
+		p.measuredCount.Add(1)
+	}
+	e.latency.Store(next)
+	p.refreshCutoff()
+}
+
+// minMeasuredForCutoff is how many sampled exits we need before ranking any of
+// them. Below this the "fast half" would be noise, and steering on noise would
+// concentrate viewers for no gain.
+const minMeasuredForCutoff = 8
+
+// explorerShare: 1 viewer in 16 is routed off the ranked set so unmeasured exits
+// keep getting sampled. Deterministic in the sticky key, so an explorer is still
+// pinned to one exit for its whole session — exploration costs that viewer a
+// possibly-slower exit, never its connection reuse.
+const explorerShare = 16
+
+// refreshCutoff recomputes the fast/slow boundary at most every 30s.
+func (p *proxyPool) refreshCutoff() {
+	// Checked BEFORE the timestamp CAS: bailing out after claiming the slot
+	// would block the next recompute for a full 30s, so a pool that had just
+	// 7 samples at startup would run unsteered far longer than intended.
+	if p.measuredCount.Load() < minMeasuredForCutoff {
+		return
+	}
+	now := time.Now().UnixNano()
+	prev := p.lastCutoffCalc.Load()
+	if now-prev < int64(30*time.Second) || !p.lastCutoffCalc.CompareAndSwap(prev, now) {
+		return
+	}
+	measured := make([]int64, 0, len(p.entries))
+	for _, e := range p.entries {
+		if l := e.latency.Load(); l > 0 {
+			measured = append(measured, l)
+		}
+	}
+	if len(measured) < minMeasuredForCutoff {
+		return
+	}
+	slices.Sort(measured)
+	// The MEDIAN, deliberately — not p10. A tighter cutoff would funnel every
+	// viewer onto a handful of exits and recreate the per-IP throttling the pool
+	// exists to spread. Half of 1000 exits is still plenty of diversity.
+	p.fastCutoff.Store(measured[len(measured)/2])
+}
+
 // warnDrained logs an exhausted pool at most once every 30s. Without the
 // throttle a drained pool would log on every single segment fetch.
 func (p *proxyPool) warnDrained(size int) {
@@ -332,7 +519,18 @@ func proxyForRequest(req *http.Request) (*url.URL, error) {
 	if !shouldProxyRequest(req) {
 		return nil, nil
 	}
-	return upstreamProxyPool.next(), nil
+	return upstreamProxyPool.pickFor(req, 0), nil
+}
+
+// pickFor selects this request's exit IP. A request carrying a sticky key (every
+// request that came through handleProxy) gets a proxy pinned to its viewer +
+// target host, so its segments reuse one warm tunnel; anything else falls back
+// to plain rotation.
+func (p *proxyPool) pickFor(req *http.Request, attempt int) *url.URL {
+	if key, ok := req.Context().Value(stickyKeyKey{}).(uint64); ok {
+		return p.sticky(key, attempt)
+	}
+	return p.next()
 }
 
 func retryableUpstreamStatus(status int) bool {
@@ -373,10 +571,18 @@ func doUpstream(req *http.Request, useHTTP2 bool) (*http.Response, error) {
 		nextReq := req
 		var proxy *url.URL
 		if proxied {
-			proxy = upstreamProxyPool.next()
+			// attempt i, so a retry steps off a proxy that just failed while a
+			// healthy first attempt keeps every segment on the same warm tunnel.
+			proxy = upstreamProxyPool.pickFor(req, i)
 			nextReq = req.Clone(context.WithValue(req.Context(), forcedProxyKey{}, proxy))
 		}
+		started := time.Now()
 		resp, err := client.Do(nextReq)
+		if err == nil {
+			// Do returns once headers are in, so this is time-to-first-byte —
+			// exactly the cost we want to steer on.
+			upstreamProxyPool.observe(proxy, time.Since(started))
+		}
 		if err != nil {
 			// Couldn't even complete the request through this proxy — most
 			// likely a dead exit. Bench it for longer than a rate limit.
@@ -445,7 +651,15 @@ var httpClient = &http.Client{
 		ExpectContinueTimeout: 1 * time.Second,
 
 		// Opt-in: skip cert verification for upstreams with broken certs.
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS},
+		// The session cache is NOT optional-nice: net/http never sets one, and
+		// crypto/tls skips resumption entirely when it's nil, so without this
+		// every reconnect pays a full handshake. With it, TLS 1.3 resumes in
+		// 1-RTT — which is what the first segment of a stream, a retry, and any
+		// reconnect after IdleConnTimeout all pay.
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: insecureTLS,
+			ClientSessionCache: tls.NewLRUClientSessionCache(512),
+		},
 
 		// If an upstream accepts our connection but never sends response headers,
 		// give up after 15s instead of hanging a goroutine forever.
@@ -494,7 +708,10 @@ var h2Client = &http.Client{
 
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: insecureTLS},
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: insecureTLS,
+			ClientSessionCache: tls.NewLRUClientSessionCache(512),
+		},
 		ResponseHeaderTimeout: 15 * time.Second,
 	},
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
