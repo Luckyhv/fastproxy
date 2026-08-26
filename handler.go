@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"hash/fnv"
 	"io"
 	"log"
 	"net"
@@ -14,11 +13,6 @@ import (
 	"sync"
 	"syscall"
 )
-
-// isPublicHostFn is the SSRF hostname check, behind a package-level var purely
-// so benchmarks can point the proxy at a loopback origin. Unexported and never
-// reassigned outside tests — production always runs isPublicHost.
-var isPublicHostFn = isPublicHost
 
 // isPublicHost is the cheap, no-DNS SSRF check on the target hostname: reject
 // "localhost" and literal private/loopback IPs outright for a clean 403. Real
@@ -34,57 +28,34 @@ func isPublicHost(host string) bool {
 	return true // hostname — dialControl validates the resolved IP
 }
 
-// streamBufSize is the scratch buffer handed to each in-flight stream, and the
-// single biggest memory term on the box: it is charged per concurrent viewer.
-//
-// Set to 512 KiB by preference. Note for whoever tunes this next — the benchmarks
-// in perf_test.go say the size does NOT buy speed:
-//
-//	BenchmarkBufferSizeSweep (CDN-like load) is flat from 32 KiB to 1 MiB
-//	(1871-1918 MB/s) because the limit is the network, not syscall count, while
-//	memory rises straight-line: 646 KiB/viewer at 32 KiB, 2242 KiB at 1 MiB.
-//	BenchmarkSingleStreamCeiling puts the knee at 64 KiB — it matches 1 MiB even
-//	where syscalls dominate (4053 vs 4153 MB/s), while 32 KiB drops 22%.
-//
-// Time-to-first-byte is unaffected either way: io.CopyBuffer writes whatever a
-// single Read returns, so it never waits to fill the buffer.
-//
-// What the size DOES change is how many viewers fit in RAM — keep
-// perStreamBudget in tune.go in step with it, or autoTune will over-admit.
-//
-// It is a var only so benchmarks can sweep it.
-var streamBufSize = 512 * 1024
-
-// bufPool hands out scratch buffers and takes them back when a stream ends, so
-// we don't allocate (and then garbage-collect) a fresh one per request.
+// bufPool hands out 1 MB scratch buffers and takes them back when a stream ends,
+// so we don't allocate (and then garbage-collect) a fresh buffer for every
+// request. Buffer size is a knob: smaller = less RAM per concurrent stream (more
+// viewers per box), larger = fewer read/write syscalls (more throughput per big
+// file). 1 MB favors throughput; autoTune()'s perStreamBudget is sized to match.
 var bufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, streamBufSize)
+		b := make([]byte, 1024*1024) // 1 MB
 		return &b
 	},
-}
-
-// getBuf borrows a buffer, discarding any pooled one that predates a benchmark's
-// size change.
-func getBuf() *[]byte {
-	b := bufPool.Get().(*[]byte)
-	if len(*b) != streamBufSize {
-		nb := make([]byte, streamBufSize)
-		return &nb
-	}
-	return b
 }
 
 // headersToForward are the upstream response headers we pass through to the
 // client. We allow-list rather than copy everything, so hop-by-hop and
 // origin-leaking headers never reach the viewer.
+//
+// These MUST stay in Go's canonical form (http.CanonicalHeaderKey: first letter
+// and every letter after a hyphen capitalized, the rest lowered — so "Etag", NOT
+// "ETag"). The copy loop indexes both header maps directly to skip textproto
+// canonicalization on every request, and a non-canonical key here would simply
+// never match. TestHeadersToForwardAreCanonical guards this.
 var headersToForward = []string{
 	"Content-Type",
 	"Content-Length",
 	"Content-Range",
 	"Accept-Ranges",
 	"Last-Modified",
-	"ETag",
+	"Etag",
 }
 
 // allowRawURL enables plain-URL mode (/stream?url=...). On by default so any
@@ -98,6 +69,26 @@ type readerCloser struct {
 	io.Reader
 	io.Closer
 }
+
+// writerOnly hides every method of a ResponseWriter except Write.
+//
+// This is load-bearing, not cosmetic. io.CopyBuffer only uses the buffer you
+// hand it when NEITHER side offers a shortcut: if the destination implements
+// io.ReaderFrom it calls dst.ReadFrom(src) and DROPS the buffer on the floor.
+// net/http's *response does implement ReaderFrom, so a bare
+// io.CopyBuffer(w, body, oneMegBuffer) silently ignored our 1 MB buffer and ran
+// the transfer through net/http's internal 32 KB one — and for a non-chunked
+// response it went further, to net.TCPConn.ReadFrom, which (with an HTTP body
+// as src, so neither splice nor sendfile can apply) falls back to io.Copy and
+// allocates yet another 32 KB buffer per stream.
+//
+// That ReaderFrom shortcut exists to reach sendfile/splice, and neither can
+// ever fire here: our source is an HTTP response body, not a file or a raw TCP
+// socket. So hiding it costs nothing and buys 32x larger reads and writes:
+// +31% on a 4 MB segment and +52% on a 32 MB file over loopback, where the
+// network is free — see BenchmarkStreamReaderFrom vs BenchmarkStreamPooledBuf.
+// On a real path the win shows up as CPU per byte, i.e. streams per box.
+type writerOnly struct{ io.Writer }
 
 // knownRoutes are the path prefixes the player will hit. The encrypted token is
 // the segment right after the prefix. We keep a small set so a bare /<token>
@@ -144,12 +135,17 @@ func proxyBaseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-func proxyURLFor(r *http.Request, targetURL, referer, server string) string {
-	route := "stream"
-	if parsed, err := url.Parse(targetURL); err == nil && isM3U8URL(parsed) {
-		route = "m3u8"
+// proxyRoute picks the path prefix a rewritten child URL gets. Playlists go to
+// /m3u8/ so the next hop knows to rewrite again; everything else streams.
+func proxyRoute(targetURL string) string {
+	if isM3U8Ref(targetURL) {
+		return "/m3u8/"
 	}
-	return proxyBaseURL(r) + "/" + route + "/" + EncodePayload(targetURL, referer, server)
+	return "/stream/"
+}
+
+func proxyURLFor(r *http.Request, targetURL, referer, server string) string {
+	return proxyBaseURL(r) + proxyRoute(targetURL) + EncodePayload(targetURL, referer, server)
 }
 
 func serveManifest(w http.ResponseWriter, r *http.Request, resp *http.Response, base *url.URL, referer, server string) {
@@ -165,24 +161,32 @@ func serveManifest(w http.ResponseWriter, r *http.Request, resp *http.Response, 
 	// serving a truncated file (a big asset behind a .m3u8 URL would otherwise
 	// arrive cut off at exactly 10 MiB, with a 200).
 	if !bytes.HasPrefix(bytes.TrimSpace(body), []byte("#EXTM3U")) {
+		// A media body behind a manifest-looking URL still gets the masquerade,
+		// so this path can't become a hole that advertises video/*.
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
+			if masked := maskedContentType(ct, resp.StatusCode); masked != "" {
+				ct = masked
+			}
 			w.Header().Set("Content-Type", ct)
 		}
 		setCC(w.Header(), noStore) // not a playlist and not a known asset — don't pin it
 		w.WriteHeader(resp.StatusCode)
 		if _, err := w.Write(body); err == nil && len(body) == maxManifestSize {
-			buf := getBuf()
+			buf := bufPool.Get().(*[]byte)
 			defer bufPool.Put(buf)
-			_, _ = io.CopyBuffer(w, resp.Body, *buf)
+			_, _ = io.CopyBuffer(writerOnly{w}, resp.Body, *buf)
 		}
 		return
 	}
 
 	// encode closes over `referer` and `server` so every child URL we emit carries
 	// the same identity — segments and keys have to forge the origin exactly like
-	// the manifest did, and they inherit it from here.
+	// the manifest did, and they inherit it from here. The proxy base is hoisted
+	// out: it is the same for every line, and rebuilding it per segment cost an
+	// allocation on each of a 1200-line playlist's rows.
+	self := proxyBaseURL(r)
 	encode := func(uri string) string {
-		return proxyURLFor(r, uri, referer, server)
+		return self + proxyRoute(uri) + EncodePayload(uri, referer, server)
 	}
 	rewritten := rewritePlaylist(body, base, encode)
 
@@ -203,7 +207,21 @@ func serveManifest(w http.ResponseWriter, r *http.Request, resp *http.Response, 
 		setCC(h, livePolicy)
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, _ = w.Write(rewritten)
+	w.Write(rewritten)
+}
+
+// rawURLQuery returns the parsed query when this is a raw-URL request
+// (/stream?url=...), and nil when it is not — so the token path never pays for
+// parsing a query string it doesn't have.
+func rawURLQuery(r *http.Request) url.Values {
+	if !allowRawURL || r.URL.RawQuery == "" {
+		return nil
+	}
+	q := r.URL.Query()
+	if q.Get("url") == "" {
+		return nil
+	}
+	return q
 }
 
 // inFlight optionally caps how many streams we serve at once. Backpressure
@@ -225,21 +243,22 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1. Resolve the target. Two ways in:
-	//    a) plain-URL mode: /stream?url=<absolute-url>&ref=<referer>&sv=<server> — the easy
+	//    a) plain-URL mode: /stream?url=<absolute-url>&ref=<referer> — the easy
 	//       way to proxy any HLS stream. Disable with ALLOW_RAW_URL=0 if you only
 	//       want tokenized (key-tied) access.
 	//    b) token mode: /stream/<encrypted-payload> (what the frontend generates).
+	//    Token links carry no query string at all, which is the overwhelming
+	//    majority of our traffic (one request per segment). Gating on RawQuery
+	//    keeps url.Query()'s parse + map allocation off that path entirely.
 	var rawURL, referer, server string
-	if q := r.URL.Query(); allowRawURL && q.Get("url") != "" {
+	if q := rawURLQuery(r); q != nil {
 		rawURL = q.Get("url")
 		referer = q.Get("ref")
 		if referer == "" {
 			referer = q.Get("referer")
 		}
-		server = q.Get("sv")
-		if server == "" {
-			server = q.Get("server")
-		}
+		// Raw-URL mode gets the same provider steering as a token: ?server=uwu.
+		server = q.Get("server")
 	} else {
 		token := extractPayload(r.URL.Path)
 		if token == "" {
@@ -261,7 +280,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// SSRF guard: refuse targets that resolve to loopback/private/link-local
 	// space, so a forged token can't make us fetch internal services or cloud
 	// metadata (169.254.169.254). External video CDNs are always public IPs.
-	if !isPublicHostFn(target.Hostname()) {
+	if !isPublicHost(target.Hostname()) {
 		http.Error(w, "forbidden target", http.StatusForbidden)
 		return
 	}
@@ -281,11 +300,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	} else if r.Method == http.MethodHead {
 		upstreamMethod = http.MethodGet
 	}
-	ctx := context.WithValue(r.Context(), proxyServerKey{}, strings.ToLower(strings.TrimSpace(server)))
-	// Pin this viewer's stream to one exit IP so its segments reuse a warm
-	// tunnel instead of re-handshaking per segment (see proxyPool.sticky).
-	ctx = context.WithValue(ctx, stickyKeyKey{}, stickyKey(clientIP(r), target.Hostname()))
-	req, err := http.NewRequestWithContext(ctx, upstreamMethod, target.String(), reqBody)
+	req, err := http.NewRequestWithContext(r.Context(), upstreamMethod, target.String(), reqBody)
 	if err != nil {
 		http.Error(w, "bad request", http.StatusInternalServerError)
 		return
@@ -308,17 +323,24 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			req.Header.Set(k, v)
 		}
 	}
-	// Many video hosts only serve bytes when the request both LOOKS like a browser
-	// and claims to come from their own player page. applyUpstreamHeaders stamps
-	// the browser-shaped baseline and the Origin/Referer this provider demands
-	// (see domains.go), and tells us whether it also refuses HTTP/1.1.
+	// Many video hosts only serve bytes when the request both LOOKS like a real
+	// browser and claims to come from that host's own player page. Both of those
+	// live in domains.go, keyed by the provider name the token carries — the CDN
+	// hostnames rotate, the provider doesn't. Falls back to the token referer,
+	// then to the target's own origin.
 	useHTTP2 := applyUpstreamHeaders(req, target, referer, server)
-	// Never let upstream gzip video bytes; set last so nothing above overrides it.
 	req.Header.Set("Accept-Encoding", "identity")
+
+	// A couple of providers sit behind a Cloudflare config that 403s HTTP/1.1
+	// outright, so they get the h2 client; everyone else keeps h1 for throughput.
+	client := httpClient
+	if useHTTP2 {
+		client = h2Client
+	}
 
 	// 4. Fire the upstream fetch. resp.Body is a STREAM, not the full payload —
 	//    nothing has been downloaded into memory yet at this line.
-	resp, err := doUpstream(req, useHTTP2)
+	resp, err := client.Do(req)
 	if err != nil {
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
@@ -335,24 +357,19 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		abs := resolve(loc, target)
 		resp.Body.Close() // release the redirect response's connection
-		if (abs.Scheme != "http" && abs.Scheme != "https") || !isPublicHostFn(abs.Hostname()) {
+		if (abs.Scheme != "http" && abs.Scheme != "https") || !isPublicHost(abs.Hostname()) {
 			http.Error(w, "forbidden redirect target", http.StatusForbidden)
 			return
 		}
 		target = abs
-		nreq, nerr := http.NewRequestWithContext(ctx, upstreamMethod, target.String(), nil)
+		nreq, nerr := http.NewRequestWithContext(r.Context(), upstreamMethod, target.String(), nil)
 		if nerr != nil {
 			http.Error(w, "bad redirect", http.StatusBadGateway)
 			return
 		}
-		nreq.Header = req.Header.Clone() // carry Range / conditionals across the hop
-		// A hop can land on a different CDN with a different player-origin (and
-		// HTTP-version) requirement, so re-resolve rather than replaying the
-		// previous host's identity.
-		useHTTP2 = applyUpstreamHeaders(nreq, target, referer, server)
-		nreq.Header.Set("Accept-Encoding", "identity")
+		nreq.Header = req.Header // same forged headers on every hop
 		req = nreq
-		resp, err = doUpstream(req, useHTTP2)
+		resp, err = client.Do(req)
 		if err != nil {
 			http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 			return
@@ -388,10 +405,17 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if !isManifest && resp.StatusCode == http.StatusOK && r.Method != http.MethodHead && !isCacheableAsset(target.Path) {
 		peek := make([]byte, len("#EXTM3U"))
 		n, _ := io.ReadFull(resp.Body, peek)
-		// Stitch the peeked bytes back in front of the remaining stream.
-		resp.Body = readerCloser{io.MultiReader(bytes.NewReader(peek[:n]), resp.Body), resp.Body}
 		sniffed = peek[:n]
 		isManifest = string(sniffed) == "#EXTM3U"
+		if isManifest {
+			// Only the manifest path needs the peeked bytes stitched back onto
+			// the reader, because serveManifest reads the body as one unit. The
+			// streaming path deliberately does NOT get a MultiReader: that
+			// wrapper would sit in front of every 1 MB read for the whole
+			// transfer to replay 7 bytes it already handed back. It writes the
+			// prefix once itself instead (step 7 below).
+			resp.Body = readerCloser{io.MultiReader(bytes.NewReader(sniffed), resp.Body), resp.Body}
+		}
 	}
 	if isManifest {
 		serveManifest(w, r, resp, target, referer, server)
@@ -402,8 +426,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//    top (long-immutable for media assets, no-store for error statuses).
 	out := w.Header()
 	for _, k := range headersToForward {
-		if v := resp.Header.Get(k); v != "" {
-			out.Set(k, v)
+		// Direct map access on both sides: the keys are already canonical (see
+		// headersToForward), so this skips the textproto canonicalization that
+		// Get/Set would redo for every header on every request. The value slice
+		// is shared with resp.Header, which is safe because every later writer
+		// here uses Set — that replaces the slice rather than mutating it.
+		if v := resp.Header[k]; len(v) > 0 && v[0] != "" {
+			out[k] = v
 		}
 	}
 	ct = responseContentType(target.Hostname(), target.Path, resp.Header)
@@ -414,10 +443,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if tsCT := mpegTSContentType(sniffed, ct); tsCT != "" {
 		ct = tsCT
 	}
-	if ct != "" {
-		out.Set("Content-Type", ct)
-	}
+	// Cache policy is decided from the TRUE content-type, BEFORE any masquerade —
+	// masking must never be able to change what the edge stores or for how long.
 	setAssetCache(out, target.Path, resp.StatusCode, ct)
+	// Last step: optionally advertise media as image/jpeg (MASK_SEGMENT_TYPE=1).
+	if masked := maskedContentType(ct, resp.StatusCode); masked != "" {
+		out.Set("Content-Type", masked)
+	}
 
 	// 6. Send the upstream status line (200 full body, 206 for a Range).
 	w.WriteHeader(resp.StatusCode)
@@ -433,46 +465,23 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	//    has room. A slow viewer therefore slows our reads from upstream, so at
 	//    most ~one buffer is in flight per connection — RAM stays bounded (flat)
 	//    no matter how slow the client, instead of buffering the whole file.
-	buf := getBuf()
+	// Replay the bytes the manifest sniff consumed. This body was NOT wrapped in
+	// a MultiReader (see step 4b), so the prefix is written once, here, and the
+	// copy below then runs against the bare upstream body.
+	if len(sniffed) > 0 {
+		if _, err := w.Write(sniffed); err != nil {
+			return
+		}
+	}
+
+	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
-	_, err = io.CopyBuffer(w, resp.Body, *buf)
+	_, err = io.CopyBuffer(writerOnly{w}, resp.Body, *buf)
 	if err != nil && !isClientGone(err) {
 		// Only log genuine failures — client disconnects (seek/close) are normal
 		// for video and would otherwise spam the log on every interaction.
 		log.Printf("stream error: %v", err)
 	}
-}
-
-// clientIP is the viewer's address. We sit behind Cloudflare and a local reverse
-// proxy, so RemoteAddr is the last hop, not the viewer — without the forwarded
-// headers every viewer would share one sticky key and therefore one exit IP,
-// which is exactly the per-IP throttling the pool exists to avoid.
-func clientIP(r *http.Request) string {
-	if v := strings.TrimSpace(r.Header.Get("CF-Connecting-IP")); v != "" {
-		return v
-	}
-	if v := r.Header.Get("X-Forwarded-For"); v != "" {
-		// Left-most entry is the original client; the rest are proxies.
-		if first, _, found := strings.Cut(v, ","); found {
-			return strings.TrimSpace(first)
-		}
-		return strings.TrimSpace(v)
-	}
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
-	}
-	return r.RemoteAddr
-}
-
-// stickyKey hashes viewer + upstream host into the pool index. Including the
-// host means one viewer watching from two CDNs gets two exits (so a block on one
-// doesn't follow them), while every segment of a single stream shares one.
-func stickyKey(clientIP, host string) uint64 {
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(clientIP))
-	_, _ = h.Write([]byte{0})
-	_, _ = h.Write([]byte(host))
-	return h.Sum64()
 }
 
 // isClientGone reports whether a copy error is just the viewer disconnecting

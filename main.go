@@ -9,23 +9,23 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 )
 
 func main() {
-	// Dev helper:  `fastproxy encode <url> [referer] [server]`  prints a path token
-	// you can paste after /stream/ to test. Not part of the server path.
+	// Dev helper:  `fastproxy encode <url> [referer]`  prints a path token you can
+	// paste after /stream/ to test. Not part of the server path.
 	if len(os.Args) > 1 && os.Args[1] == "encode" {
-		ref, server := "", ""
+		ref := ""
 		if len(os.Args) > 3 {
 			ref = os.Args[3]
 		}
+		srv := ""
 		if len(os.Args) > 4 {
-			server = os.Args[4]
+			srv = os.Args[4]
 		}
-		fmt.Println(EncodePayload(os.Args[2], ref, server))
+		fmt.Println(EncodePayload(os.Args[2], ref, srv))
 		return
 	}
 
@@ -37,19 +37,13 @@ func main() {
 	} else {
 		log.Printf("origin allow-list: OPEN — set ALLOWED_ORIGINS to restrict")
 	}
-	if upstreamProxyPool.len() > 0 {
-		log.Printf("upstream proxy pool active: %d proxies, servers=%v domains=%v, cooldowns rate=%s error=%s 5xx=%s",
-			upstreamProxyPool.len(), upstreamProxyServers, upstreamProxyDomains,
-			proxyRatePenalty, proxyErrorPenalty, proxyServerPenalty)
-	} else {
-		log.Printf("upstream proxy pool: disabled")
-	}
 
 	// BIND_ADDR lets you restrict the listen interface. Behind a reverse proxy
 	// (Caddy/nginx) on the same box, set BIND_ADDR=127.0.0.1 so the proxy is not
 	// reachable from the public internet directly. Empty = all interfaces.
 	addr := getenv("BIND_ADDR", "") + ":" + getenv("PORT", "3847")
 
+	// Everything goes to the proxy handler; there are no side endpoints.
 	mux := http.NewServeMux()
 	mux.Handle("/", withCORS(handleProxy))
 
@@ -94,22 +88,6 @@ func getenv(k, def string) string {
 	ensureEnv() // load .env once, before the first config read
 	if v := os.Getenv(k); v != "" {
 		return v
-	}
-	return def
-}
-
-// getenvDuration reads a duration knob. Accepts a Go duration ("90s", "5m") or
-// a bare number of seconds; anything unparseable falls back to def.
-func getenvDuration(k string, def time.Duration) time.Duration {
-	v := strings.TrimSpace(getenv(k, ""))
-	if v == "" {
-		return def
-	}
-	if d, err := time.ParseDuration(v); err == nil {
-		return d
-	}
-	if n, err := strconv.Atoi(v); err == nil {
-		return time.Duration(n) * time.Second
 	}
 	return def
 }
