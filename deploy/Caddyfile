@@ -8,32 +8,14 @@
 # (If you ever drop the origin cert, replace the `tls` line with `tls internal`
 # and set Cloudflare SSL mode to "Full".)
 
-{
-	# Caddy's admin API only listens on localhost by default, but this box does
-	# not need runtime config pushes. Disabling it removes one listening socket.
-	admin off
-}
-
-{$PROXY_HOST:proxy.example.com} {
+proxy.anicore.tv {
 	tls /etc/ssl/cloudflare/cert.pem /etc/ssl/cloudflare/key.pem
 
-	header {
-		# Avoid advertising origin software through Cloudflare.
-		-Server
-	}
-
 	reverse_proxy 127.0.0.1:3847 {
-		# Caddy streams responses by default. Avoid request/response buffer
-		# directives here; they add memory pressure for video traffic.
-		transport http {
-			dial_timeout 5s
-			response_header_timeout 30s
-			keepalive 2m
-		}
-
-		# Preserve the client/proxy headers the app may need for logs/debugging.
+		# Stream large bodies through without buffering the whole response.
+		flush_interval -1
+		# Preserve the client headers the proxy relies on.
 		header_up Host {host}
 		header_up X-Forwarded-For {remote_host}
-		header_up X-Forwarded-Proto {scheme}
 	}
 }
