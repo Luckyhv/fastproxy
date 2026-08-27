@@ -1,18 +1,13 @@
 package main
 
 import (
-	"context"
 	"crypto/tls"
 	"fmt"
 	"log"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -49,288 +44,21 @@ func dialControl(network, address string, _ syscall.RawConn) error {
 var insecureTLS = getenv("INSECURE_TLS", "") == "1"
 
 // ─── Selective egress proxy ──────────────────────────────────────────────────
-// Some CDNs sit behind Cloudflare or per-IP throttles. Routing JUST those hosts
-// through a proxy pool gives every upstream a separate rate-limit budget, while
-// everything else stays direct (proxies are slow + metered).
+// Some CDNs (e.g. vid-cdn.xyz) sit behind Cloudflare and 403 our datacenter IP.
+// Routing JUST those hosts through a clean/residential proxy bypasses the block,
+// while everything else goes direct (proxies are slow + metered, so we don't
+// want all traffic on them).
 //
-//	UPSTREAM_PROXIES        = comma-separated proxy URLs
-//	UPSTREAM_PROXY_FILE     = file with one proxy per line
-//	UPSTREAM_PROXY          = legacy single proxy URL
-//	UPSTREAM_PROXY_SERVERS  = provider keys to route, or "*" for every token
-//	UPSTREAM_PROXY_DOMAINS  = legacy host suffix fallback for old tokens
+//	UPSTREAM_PROXY          = http://user:pass@host:port   (the egress proxy)
+//	UPSTREAM_PROXY_DOMAINS  = vid-cdn.xyz,foo.com          (suffixes to route)
 //
-// Supported proxy forms:
-//   - http://user:pass@host:port
-//   - host:port
-//   - host:port:user:pass
+// If UPSTREAM_PROXY is set but DOMAINS is empty, ALL upstream traffic is proxied.
 var (
-	upstreamProxyPool    = newProxyPool(proxyEnv()).randomStart()
-	upstreamProxyServers = parseNames(getenv("UPSTREAM_PROXY_SERVERS", defaultUpstreamProxyServers))
-	upstreamProxyDomains = parseNames(getenv("UPSTREAM_PROXY_DOMAINS", ""))
+	upstreamProxyURL, _  = url.Parse(getenv("UPSTREAM_PROXY", ""))
+	upstreamProxyDomains = parseDomains(getenv("UPSTREAM_PROXY_DOMAINS", ""))
 )
 
-const defaultUpstreamProxyServers = "uwu,kiwi,wave"
-
-// How long a proxy sits out after a failure. Rate limits are per-IP and
-// short-lived, so a throttled proxy is worth reusing soon; a proxy we could not
-// even connect through is probably dead and gets a longer rest.
-var (
-	proxyRatePenalty  = getenvDuration("UPSTREAM_PROXY_RATE_COOLDOWN", 60*time.Second)
-	proxyErrorPenalty = getenvDuration("UPSTREAM_PROXY_ERROR_COOLDOWN", 5*time.Minute)
-	// Upstream 5xx is usually the origin's fault, not the exit IP's — brief
-	// enough that one flaky origin can't drain the pool.
-	proxyServerPenalty = getenvDuration("UPSTREAM_PROXY_5XX_COOLDOWN", 15*time.Second)
-)
-
-type forcedProxyKey struct{}
-type proxyServerKey struct{}
-type stickyKeyKey struct{}
-
-// proxyEntry is one exit IP plus its cooldown deadline (unix nanos, 0 =
-// healthy). Held by pointer so the atomic is never copied.
-type proxyEntry struct {
-	url         *url.URL
-	bannedUntil atomic.Int64
-}
-
-type proxyPool struct {
-	entries []*proxyEntry
-	// byURL maps a handed-out *url.URL back to its entry so callers can
-	// penalize the exact proxy a request went through. Pointer identity is
-	// safe: next() only ever returns pointers out of entries.
-	byURL        map[*url.URL]*proxyEntry
-	cursor       uint64
-	lastDrainLog atomic.Int64
-}
-
-func proxyEnv() []string {
-	values := parseProxyList(getenv("UPSTREAM_PROXIES", ""))
-	if single := strings.TrimSpace(getenv("UPSTREAM_PROXY", "")); single != "" {
-		values = append(values, single)
-	}
-	if file := strings.TrimSpace(getenv("UPSTREAM_PROXY_FILE", "")); file != "" {
-		if data, err := os.ReadFile(file); err == nil {
-			values = append(values, parseProxyList(string(data))...)
-		}
-	}
-	return values
-}
-
-func parseProxyList(s string) []string {
-	var out []string
-	for _, raw := range strings.FieldsFunc(s, func(r rune) bool {
-		return r == ',' || r == '\n' || r == '\r' || r == '\t' || r == ' '
-	}) {
-		raw = strings.TrimSpace(raw)
-		if raw == "" || strings.HasPrefix(raw, "#") {
-			continue
-		}
-		out = append(out, raw)
-	}
-	return out
-}
-
-func newProxyPool(values []string) *proxyPool {
-	seen := map[string]bool{}
-	pool := &proxyPool{byURL: map[*url.URL]*proxyEntry{}}
-	for _, raw := range values {
-		normalized := normalizeProxy(raw)
-		if normalized == "" || seen[normalized] {
-			continue
-		}
-		u, err := url.Parse(normalized)
-		if err != nil || u.Scheme == "" || u.Host == "" {
-			continue
-		}
-		seen[normalized] = true
-		entry := &proxyEntry{url: u}
-		pool.entries = append(pool.entries, entry)
-		pool.byURL[u] = entry
-	}
-	return pool
-}
-
-// randomStart offsets the cursor so that several fastproxy instances sharing
-// one proxies.txt don't march through the pool in lockstep and hammer the same
-// exit IP at the same moment. Only the production pool uses it — newProxyPool
-// stays deterministic so tests can assert rotation order.
-func (p *proxyPool) randomStart() *proxyPool {
-	if n := p.len(); n > 1 {
-		p.cursor = uint64(rand.Intn(n))
-	}
-	return p
-}
-
-func normalizeProxy(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	if strings.Contains(raw, "://") {
-		return raw
-	}
-	parts := strings.Split(raw, ":")
-	if len(parts) == 4 {
-		host, port, user, pass := parts[0], parts[1], parts[2], parts[3]
-		return (&url.URL{
-			Scheme: "http",
-			User:   url.UserPassword(user, pass),
-			Host:   net.JoinHostPort(host, port),
-		}).String()
-	}
-	return "http://" + raw
-}
-
-func (p *proxyPool) len() int {
-	if p == nil {
-		return 0
-	}
-	return len(p.entries)
-}
-
-// healthy reports how many proxies are not currently cooling down. Diagnostics
-// only — nothing routes on it.
-func (p *proxyPool) healthy() int {
-	now := time.Now().UnixNano()
-	n := 0
-	for _, e := range p.entries {
-		if e.bannedUntil.Load() <= now {
-			n++
-		}
-	}
-	return n
-}
-
-// next hands out the next proxy in round-robin order, skipping any that are
-// still cooling down after a recent failure. Round-robin (rather than a random
-// pick) keeps the spread exactly even across the pool and guarantees that the
-// retry attempts for one request walk distinct proxies.
-func (p *proxyPool) next() *url.URL {
-	n := p.len()
-	if n == 0 {
-		return nil
-	}
-	now := time.Now().UnixNano()
-	start := atomic.AddUint64(&p.cursor, 1) - 1
-
-	var soonest *proxyEntry
-	var soonestUntil int64
-	for off := 0; off < n; off++ {
-		e := p.entries[int((start+uint64(off))%uint64(n))]
-		until := e.bannedUntil.Load()
-		if until <= now {
-			// Advance past the slots we skipped so the next caller resumes
-			// AFTER the proxy we just used. Without this, the healthy entry
-			// sitting behind a cooling one gets picked twice per lap.
-			if off > 0 {
-				atomic.AddUint64(&p.cursor, uint64(off))
-			}
-			return e.url
-		}
-		if soonest == nil || until < soonestUntil {
-			soonest, soonestUntil = e, until
-		}
-	}
-	// Every proxy is cooling down — the whole pool got throttled, or a dead
-	// link 403'd its way through it. Failing the fetch outright would be worse
-	// than one more try, so use whichever is closest to recovering.
-	p.warnDrained(n)
-	return soonest.url
-}
-
-// sticky picks a proxy deterministically from `key`, returning the attempt'th
-// HEALTHY entry at or after that starting point.
-//
-// This is the counterpart to next(), and the reason it exists is connection
-// reuse. Go's Transport keys its idle keep-alive pool on the proxy URL, so
-// handing out a different proxy per request guarantees a pool miss: every HLS
-// segment then pays a fresh TCP connect + CONNECT tunnel + TLS handshake to the
-// CDN (measured at ~1000ms/segment vs ~300ms once pinned). Pinning one exit per
-// viewer-stream lets a whole playback session ride one warm connection, while
-// DIFFERENT viewers still land on different exits — which is what the per-IP
-// rate limits actually care about. Rotation was never buying us anything within
-// a single session; it was only costing handshakes.
-//
-// attempt > 0 walks to the next healthy exit, so doUpstream's retries still
-// escape a bad proxy.
-func (p *proxyPool) sticky(key uint64, attempt int) *url.URL {
-	n := p.len()
-	if n == 0 {
-		return nil
-	}
-	now := time.Now().UnixNano()
-	start := key % uint64(n)
-
-	var soonest *proxyEntry
-	var soonestUntil int64
-	healthy := 0
-	for off := 0; off < n; off++ {
-		e := p.entries[int((start+uint64(off))%uint64(n))]
-		until := e.bannedUntil.Load()
-		if until <= now {
-			if healthy == attempt {
-				return e.url
-			}
-			healthy++
-			continue
-		}
-		if soonest == nil || until < soonestUntil {
-			soonest, soonestUntil = e, until
-		}
-	}
-	// Asked for a further attempt than there are healthy proxies — wrap around
-	// to this key's own exit rather than failing the fetch.
-	if healthy > 0 {
-		return p.sticky(key, attempt%healthy)
-	}
-	// Every proxy is cooling down — serve from whichever recovers first.
-	p.warnDrained(n)
-	return soonest.url
-}
-
-// warnDrained logs an exhausted pool at most once every 30s. Without the
-// throttle a drained pool would log on every single segment fetch.
-func (p *proxyPool) warnDrained(size int) {
-	now := time.Now().UnixNano()
-	prev := p.lastDrainLog.Load()
-	if now-prev < int64(30*time.Second) || !p.lastDrainLog.CompareAndSwap(prev, now) {
-		return
-	}
-	log.Printf("upstream proxy pool drained: %d/%d healthy — serving from a cooling proxy",
-		p.healthy(), size)
-}
-
-// penalize benches the proxy a failed request went through. Deadlines only ever
-// move later, so a concurrent shorter penalty can't cut a longer one short.
-func (p *proxyPool) penalize(u *url.URL, d time.Duration) {
-	if p == nil || u == nil || d <= 0 {
-		return
-	}
-	e := p.byURL[u]
-	if e == nil {
-		return
-	}
-	until := time.Now().Add(d).UnixNano()
-	for {
-		prev := e.bannedUntil.Load()
-		if prev >= until || e.bannedUntil.CompareAndSwap(prev, until) {
-			return
-		}
-	}
-}
-
-// proxyPenaltyFor maps an upstream status onto how long its exit IP sits out.
-func proxyPenaltyFor(status int) time.Duration {
-	switch status {
-	case http.StatusTooManyRequests, http.StatusForbidden:
-		return proxyRatePenalty
-	case http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
-		return proxyServerPenalty
-	}
-	return 0
-}
-
-func parseNames(s string) []string {
+func parseDomains(s string) []string {
 	var out []string
 	for _, d := range strings.Split(s, ",") {
 		if d = strings.TrimSpace(strings.ToLower(d)); d != "" {
@@ -340,220 +68,47 @@ func parseNames(s string) []string {
 	return out
 }
 
-func nameListed(value string, names []string) bool {
-	value = strings.ToLower(strings.TrimSpace(value))
-	if value == "" {
-		return false
-	}
-	for _, name := range names {
-		if name == "*" || name == value {
-			return true
-		}
-	}
-	return false
-}
-
-func hostListed(host string, suffixes []string) bool {
-	host = strings.ToLower(host)
-	for _, suffix := range suffixes {
-		if suffix == "*" || host == suffix || strings.HasSuffix(host, "."+suffix) {
-			return true
-		}
-	}
-	return false
-}
-
-func shouldProxyRequest(req *http.Request) bool {
-	if upstreamProxyPool.len() == 0 {
-		return false
-	}
-	if server, ok := req.Context().Value(proxyServerKey{}).(string); ok &&
-		nameListed(server, upstreamProxyServers) {
-		return true
-	}
-	// A host that recently throttled our egress IP routes through the pool even
-	// if it was never configured to, until the memory expires.
-	if hostThrottled(req.URL.Hostname()) {
-		return true
-	}
-	return len(upstreamProxyDomains) > 0 &&
-		hostListed(req.URL.Hostname(), upstreamProxyDomains)
-}
-
-// ─── Throttle memory ─────────────────────────────────────────────────────────
-// A CDN answering 429/403 to a direct fetch is rate-limiting our single egress
-// IP. That is exactly what the proxy pool is for, but until now only hosts named
-// in UPSTREAM_PROXY_SERVERS could reach it — so a provider that started
-// throttling (neko's Cloudflare Worker, Aug 2026) just failed, with a thousand
-// idle exits going unused. Remembering the host means we pay the throttled
-// response once, not on the first attempt of every subsequent segment.
-
-var throttledHosts sync.Map // lowercased host -> expiry, unix nanos
-
-// throttleMemory is deliberately short: these limits are transient, and staying
-// on the proxy costs ~3x the direct latency, so we drift back to direct quickly.
-var throttleMemory = getenvDuration("UPSTREAM_THROTTLE_MEMORY", 10*time.Minute)
-
-func markThrottled(host string) {
-	if host == "" {
-		return
-	}
-	throttledHosts.Store(strings.ToLower(host), time.Now().Add(throttleMemory).UnixNano())
-}
-
-func hostThrottled(host string) bool {
-	if host == "" {
-		return false
-	}
-	key := strings.ToLower(host)
-	v, ok := throttledHosts.Load(key)
-	if !ok {
-		return false
-	}
-	until, _ := v.(int64)
-	if time.Now().UnixNano() < until {
-		return true
-	}
-	throttledHosts.Delete(key)
-	return false
-}
-
 // proxyForRequest decides, per upstream request, whether to route via the egress
 // proxy. Returning (nil, nil) means "connect directly".
 func proxyForRequest(req *http.Request) (*url.URL, error) {
-	if forced, ok := req.Context().Value(forcedProxyKey{}).(*url.URL); ok {
-		return forced, nil
+	if upstreamProxyURL == nil || upstreamProxyURL.Host == "" {
+		return nil, nil // no egress proxy configured → always direct
 	}
-	if !shouldProxyRequest(req) {
-		return nil, nil
+	if len(upstreamProxyDomains) == 0 {
+		return upstreamProxyURL, nil // configured but no filter → proxy everything
 	}
-	return upstreamProxyPool.pickFor(req, 0), nil
-}
-
-// pickFor selects this request's exit IP. A request carrying a sticky key (every
-// request that came through handleProxy) gets a proxy pinned to its viewer +
-// target host, so its segments reuse one warm tunnel; anything else falls back
-// to plain rotation.
-func (p *proxyPool) pickFor(req *http.Request, attempt int) *url.URL {
-	if key, ok := req.Context().Value(stickyKeyKey{}).(uint64); ok {
-		return p.sticky(key, attempt)
-	}
-	return p.next()
-}
-
-func retryableUpstreamStatus(status int) bool {
-	return status == http.StatusForbidden ||
-		status == http.StatusTooManyRequests ||
-		status == http.StatusBadGateway ||
-		status == http.StatusServiceUnavailable ||
-		status == http.StatusGatewayTimeout
-}
-
-func upstreamAttempts(req *http.Request) int {
-	if req.Method == http.MethodPost || !shouldProxyRequest(req) {
-		return 1
-	}
-	n := upstreamProxyPool.len()
-	if n < 2 {
-		return 1
-	}
-	if n > 4 {
-		return 4
-	}
-	return n
-}
-
-func doUpstream(req *http.Request, useHTTP2 bool) (*http.Response, error) {
-	client := httpClient
-	if useHTTP2 {
-		client = h2Client
-	}
-	attempts := upstreamAttempts(req)
-	// Pick the exit IP here rather than letting the Transport call next() for
-	// us: we need to know which proxy served the request so a failure can be
-	// charged to it. Requests that shouldn't be proxied leave proxy nil and
-	// fall through to proxyForRequest's direct path.
-	proxied := shouldProxyRequest(req)
-	var lastErr error
-	for i := 0; i < attempts; i++ {
-		nextReq := req
-		var proxy *url.URL
-		if proxied {
-			// attempt i, so a retry steps off a proxy that just failed while a
-			// healthy first attempt keeps every segment on the same warm tunnel.
-			proxy = upstreamProxyPool.pickFor(req, i)
-			nextReq = req.Clone(context.WithValue(req.Context(), forcedProxyKey{}, proxy))
+	host := strings.ToLower(req.URL.Hostname())
+	for _, d := range upstreamProxyDomains {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return upstreamProxyURL, nil
 		}
-		resp, err := client.Do(nextReq)
-		if err != nil {
-			// Couldn't even complete the request through this proxy — most
-			// likely a dead exit. Bench it for longer than a rate limit.
-			upstreamProxyPool.penalize(proxy, proxyErrorPenalty)
-			lastErr = err
-			continue
-		}
-		if retryableUpstreamStatus(resp.StatusCode) {
-			upstreamProxyPool.penalize(proxy, proxyPenaltyFor(resp.StatusCode))
-			if i+1 < attempts {
-				resp.Body.Close()
-				continue
-			}
-			// Direct fetch got throttled and we have no attempts left because
-			// this host was never configured for the pool. Escape through it.
-			if !proxied {
-				if fallback := proxyFallback(req, useHTTP2); fallback != nil {
-					resp.Body.Close()
-					return fallback, nil
-				}
-			}
-		}
-		return resp, nil
 	}
-	return nil, lastErr
+	return nil, nil
 }
 
-// proxyFallback retries a throttled DIRECT fetch through the egress pool, and
-// remembers the host so later segments go through the pool up front instead of
-// eating a 429 first. Returns nil if the pool can't do better, in which case the
-// caller passes the original throttled response through unchanged.
+// ─── Upstream clients ────────────────────────────────────────────────────────
 //
-// GET/HEAD only: a POST's body was already consumed by the first attempt, so it
-// cannot be replayed.
-func proxyFallback(req *http.Request, useHTTP2 bool) *http.Response {
-	if upstreamProxyPool.len() == 0 || req.Method == http.MethodPost {
-		return nil
-	}
-	markThrottled(req.URL.Hostname())
-
-	proxy := upstreamProxyPool.pickFor(req, 0)
-	client := httpClient
-	if useHTTP2 {
-		client = h2Client
-	}
-	resp, err := client.Do(req.Clone(context.WithValue(req.Context(), forcedProxyKey{}, proxy)))
-	if err != nil {
-		upstreamProxyPool.penalize(proxy, proxyErrorPenalty)
-		return nil
-	}
-	if retryableUpstreamStatus(resp.StatusCode) {
-		// The exit is throttled too — bench it and let the caller surface the
-		// original response rather than this second one.
-		upstreamProxyPool.penalize(proxy, proxyPenaltyFor(resp.StatusCode))
-		resp.Body.Close()
-		return nil
-	}
-	return resp
-}
-
-// httpClient is the ONE client we reuse for every upstream fetch. Sharing a
-// single client (and therefore a single Transport) is what lets Go pool and
-// reuse TCP/TLS connections to upstreams across requests — re-dialing + a TLS
-// handshake per segment would wreck throughput.
-var httpClient = &http.Client{
-	// No Client.Timeout: a hard timeout here would also kill long video streams.
-	// We control lifetime with the request context + the per-phase timeouts on
-	// the Transport below.
-	Transport: &http.Transport{
+// We reuse a SHARED client (and therefore a shared Transport) for every upstream
+// fetch. That is what lets Go pool and reuse TCP/TLS connections across
+// requests — re-dialing plus a TLS handshake per segment would wreck throughput.
+//
+// There are exactly two, and they differ only in how they speak HTTP, so the
+// shape lives here once and the flag picks the protocol.
+//
+// HTTP/1.1 is the default. Go's HTTP/2 client uses small flow-control windows
+// (~64 KB/stream); on a high-latency VPS→CDN path that throttles large media to
+// ~window/RTT (e.g. 64KB/50ms ≈ 1.3 MB/s), making mp4 fetches crawl. HTTP/1.1
+// has no such app-level cap and streams at full TCP speed — and for a proxy (one
+// big sequential download per request) h2's multiplexing buys nothing.
+//
+// h2 is the escape hatch for upstreams that refuse HTTP/1.1. owocdn.top (uwu) is
+// the one we hit today: Cloudflare answers a 403 block page to an h1 request and
+// 200 to the byte-identical h2 one, whatever the headers. Only providers with
+// http2:true in domains.go land there. HTTP2Config lifts the receive window to
+// just under the 4 MiB ceiling the stdlib allows — ~80 MB/s at the same RTT — so
+// those hosts don't pay the penalty that made us disable h2 in the first place.
+func newClient(http2 bool) *http.Client {
+	t := &http.Transport{
 		// Per-request egress decision: route blocked hosts through the clean
 		// proxy, everything else direct.
 		Proxy: proxyForRequest,
@@ -566,98 +121,110 @@ var httpClient = &http.Client{
 			Control:   dialControl, // SSRF backstop on the resolved IP
 		}).DialContext,
 
-		// Force HTTP/1.1 to upstream. Go's HTTP/2 client uses small flow-control
-		// windows (~64 KB/stream); on a high-latency VPS→CDN path that throttles
-		// large media to ~window/RTT (e.g. 64KB/50ms ≈ 1.3 MB/s), making mp4
-		// fetches crawl. HTTP/1.1 has no such app-level cap and streams at full TCP
-		// speed — and for a proxy (one big sequential download per request) h2's
-		// multiplexing buys nothing. A non-nil empty TLSNextProto disables h2.
-		ForceAttemptHTTP2: false,
-		TLSNextProto:      map[string]func(string, *tls.Conn) http.RoundTripper{},
-
-		// 16x Go's 4 KB default: fewest syscalls per connection on large
-		// transfers. These are charged per upstream connection, idle ones
-		// included, so they trade memory for headroom on the fastest paths —
-		// BenchmarkTransportBufferSweep measured 64 KiB and 32 KiB as equal
-		// throughput under CDN-like load, with 64 KiB costing ~28% more
-		// per-viewer heap. Sized for speed by choice; see perStreamBudget.
+		// Bigger socket buffers = fewer syscalls on large transfers (default 4 KB).
 		ReadBufferSize:  64 * 1024,
-		WriteBufferSize: 8 * 1024,
+		WriteBufferSize: 64 * 1024,
 
 		// Connection-pool sizing. These caps are what let one box fan out to many
-		// concurrent viewers without exhausting sockets.
-		MaxIdleConns:        1000, // total idle keep-alive conns to keep around
-		MaxIdleConnsPerHost: 100,  // idle conns per upstream host (default is 2!)
+		// concurrent viewers without exhausting sockets. autoTune() raises them at
+		// startup on boxes with the RAM to back it — see tuneTransports.
+		MaxIdleConns:        defaultMaxIdleConns,        // total idle keep-alive conns to keep around
+		MaxIdleConnsPerHost: defaultMaxIdleConnsPerHost, // idle conns per upstream host (default is 2!)
 		IdleConnTimeout:     90 * time.Second,
 
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 
 		// Opt-in: skip cert verification for upstreams with broken certs.
-		// The session cache is NOT optional-nice: net/http never sets one, and
-		// crypto/tls skips resumption entirely when it's nil, so without this
-		// every reconnect pays a full handshake. With it, TLS 1.3 resumes in
-		// 1-RTT — which is what the first segment of a stream, a retry, and any
-		// reconnect after IdleConnTimeout all pay.
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: insecureTLS,
-			ClientSessionCache: tls.NewLRUClientSessionCache(512),
-		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: insecureTLS},
 
 		// If an upstream accepts our connection but never sends response headers,
 		// give up after 15s instead of hanging a goroutine forever.
 		ResponseHeaderTimeout: 15 * time.Second,
-	},
+	}
 
-	// Do NOT auto-follow 3xx. We want to see the redirect so we can re-wrap the
-	// Location through our own proxy (handled in a later part). Returning this
-	// sentinel makes Do() hand us the 3xx response as-is.
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
-}
-
-// h2Client is the HTTP/2 escape hatch for upstreams that refuse HTTP/1.1.
-// owocdn.top (uwu) is the one we hit today: Cloudflare answers a 403 block page
-// to an h1 request and 200 to the byte-identical h2 one, whatever the headers.
-//
-// The reason h2 isn't the default is throughput — Go's h2 client defaults to a
-// ~64 KB per-stream flow-control window, which on a high-latency VPS→CDN path
-// caps a single big download at window/RTT (64KB/50ms ≈ 1.3 MB/s). HTTP2Config
-// lifts that window to just under the 4 MiB ceiling the stdlib allows, which at
-// the same RTT is ~80 MB/s — well past what any segment needs, so hosts routed
-// here don't pay the penalty that made us disable h2 in the first place.
-var h2Client = &http.Client{
-	Transport: &http.Transport{
-		Proxy: proxyForRequest,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Control:   dialControl,
-		}).DialContext,
-
-		ForceAttemptHTTP2: true,
-		HTTP2: &http.HTTP2Config{
+	if http2 {
+		t.ForceAttemptHTTP2 = true
+		t.HTTP2 = &http.HTTP2Config{
 			MaxReceiveBufferPerStream:     4<<20 - 1,
 			MaxReceiveBufferPerConnection: 4<<20 - 1,
+		}
+	} else {
+		// A non-nil empty TLSNextProto is what actually disables h2 negotiation.
+		t.ForceAttemptHTTP2 = false
+		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+
+	return &http.Client{
+		// No Client.Timeout: a hard timeout here would also kill long video
+		// streams. We control lifetime with the request context + the per-phase
+		// timeouts on the Transport above.
+		Transport: t,
+
+		// Do NOT auto-follow 3xx. We want to see the redirect so we can re-wrap
+		// the Location through our own proxy. Returning this sentinel makes Do()
+		// hand us the 3xx response as-is.
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
+	}
+}
 
-		ReadBufferSize:  64 * 1024,
-		WriteBufferSize: 8 * 1024,
+var (
+	httpClient = newClient(false)
+	h2Client   = newClient(true)
+)
 
-		MaxIdleConns:        1000,
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
+// ─── Connection-pool sizing ──────────────────────────────────────────────────
+//
+// The per-host cap is the one that bites. Every viewer pulls segment after
+// segment from the SAME handful of CDN hostnames, so a whole box's traffic
+// funnels through one entry in the pool. Once concurrent fetches to that host
+// exceed the cap, Go closes the surplus connections the moment their response is
+// read instead of parking them — and the next segment pays a fresh TCP handshake
+// plus a full TLS handshake, which on a VPS→CDN path is one to two extra round
+// trips of dead time before a single byte of video moves.
+//
+// The reason it can't just be enormous is RAM: a pooled connection holds the
+// transport's read and write buffers (64 KiB each) plus TLS state, so we budget
+// idleConnCost per parked connection and spend at most idleConnRAMShare of
+// detected memory on them.
+const (
+	defaultMaxIdleConns        = 1000
+	defaultMaxIdleConnsPerHost = 100
 
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: insecureTLS,
-			ClientSessionCache: tls.NewLRUClientSessionCache(512),
-		},
-		ResponseHeaderTimeout: 15 * time.Second,
-	},
-	CheckRedirect: func(req *http.Request, via []*http.Request) error {
-		return http.ErrUseLastResponse
-	},
+	idleConnCost     = 160 * 1024 // 64K read + 64K write buffer + TLS state
+	idleConnRAMShare = 20         // spend at most 1/20th (5%) of RAM on parked conns
+	maxIdleConnsCap  = 20000
+)
+
+// tuneTransports sizes the connection pools from detected RAM, honouring
+// explicit env overrides. Called from autoTune() before the listener starts, so
+// no request is in flight and mutating the live transports is safe.
+func tuneTransports(mem uint64) {
+	total := defaultMaxIdleConns
+	if mem > 0 {
+		if n := int(mem / idleConnRAMShare / idleConnCost); n > total {
+			total = min(n, maxIdleConnsCap)
+		}
+	}
+	if n := atoiDefault(getenv("MAX_IDLE_CONNS", ""), 0); n > 0 {
+		total = n
+	}
+
+	// A quarter of the pool per host: enough that one busy CDN keeps its
+	// connections warm, while a second and third provider still have room. This
+	// raises the per-host cap even when RAM is undetected, and costs nothing —
+	// MaxIdleConns is the real memory ceiling, and it hasn't moved.
+	perHost := max(total/4, defaultMaxIdleConnsPerHost)
+	if n := atoiDefault(getenv("MAX_IDLE_CONNS_PER_HOST", ""), 0); n > 0 {
+		perHost = n
+	}
+
+	for _, c := range []*http.Client{httpClient, h2Client} {
+		t := c.Transport.(*http.Transport)
+		t.MaxIdleConns = total
+		t.MaxIdleConnsPerHost = perHost
+	}
+	log.Printf("autotune: idle conns=%d (per host %d)", total, perHost)
 }
