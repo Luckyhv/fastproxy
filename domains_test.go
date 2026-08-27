@@ -84,42 +84,39 @@ func TestKiwiAndWaveIdentities(t *testing.T) {
 	}
 }
 
-// No server name (a token minted before the API sent one, or cached in Redis
-// across the deploy) still has to resolve, via the CDN hostname.
-func TestHostnameAliasCoversTokensWithoutAServerName(t *testing.T) {
-	for _, tc := range []struct{ url, wantOrigin string }{
-		{"https://vault-12.owocdn.top/x/uwu.m3u8", "https://kwik.cx"},
-		{"https://hls.anidb.app/stream/abc/master.m3u8", "https://hls.anidb.app"},
-		{"https://ru-cdn1.echovideo.to/cdn/abc?t.m3u8", "https://play.echovideo.ru"},
-	} {
-		h, _ := headersFor(t, tc.url, "", "")
-		if got := h.Get("Origin"); got != tc.wantOrigin {
-			t.Fatalf("%s -> Origin %q, want %q", tc.url, got, tc.wantOrigin)
-		}
+// The server name is the ONLY key. A request without one falls straight through
+// to the token referer — no hostname guessing, even for a CDN we know by sight.
+func TestNoServerNameFallsThroughToTokenReferer(t *testing.T) {
+	h, useHTTP2 := headersFor(t, "https://vault-12.owocdn.top/x/uwu.m3u8", "https://animex.example/", "")
+	if got := h.Get("Referer"); got != "https://animex.example/" {
+		t.Fatalf("Referer = %q, want the token referer", got)
 	}
-	// …including the HTTP/2 requirement, or legacy uwu tokens would 403.
-	if _, useHTTP2 := headersFor(t, "https://vault-12.owocdn.top/x/uwu.m3u8", "", ""); !useHTTP2 {
-		t.Fatal("legacy uwu token must still get HTTP/2")
+	if got := h.Get("Origin"); got != "https://animex.example" {
+		t.Fatalf("Origin = %q, want it derived from the token referer", got)
+	}
+	if useHTTP2 {
+		t.Fatal("HTTP/2 is a per-provider opt-in; without a server name we stay on h1")
 	}
 }
 
-// An unknown server name must fall through to the hostname rather than blanking
-// out the identity.
-func TestUnknownServerFallsThroughToHost(t *testing.T) {
-	h, _ := headersFor(t, "https://vault-12.owocdn.top/x/uwu.m3u8", "", "not-a-real-server")
-	if got := h.Get("Origin"); got != "https://kwik.cx" {
-		t.Fatalf("Origin = %q, want the hostname alias to catch it", got)
+// A name we don't have an entry for behaves the same way — it must not blank out
+// the identity, because no referer at all is itself a 403 on most CDNs.
+func TestUnknownServerNameKeepsTokenReferer(t *testing.T) {
+	h, _ := headersFor(t, "https://cdn.example/x.m3u8", "https://player.example/", "not-a-real-server")
+	if got := h.Get("Referer"); got != "https://player.example/" {
+		t.Fatalf("Referer = %q, want the token referer", got)
 	}
 }
 
-// Subdomain walking must not match a suffix that isn't a label boundary:
-// "notowocdn.top" and "owocdn.top.evil.test" are not owocdn.top.
-func TestHostAliasMatchesOnLabelBoundariesOnly(t *testing.T) {
-	for _, host := range []string{"notowocdn.top", "owocdn.top.evil.test", "myanidb.app"} {
-		h, _ := headersFor(t, "https://"+host+"/a.m3u8", "", "")
-		if got := h.Get("Origin"); got != "https://"+host {
-			t.Fatalf("%s matched an alias it shouldn't: Origin = %q", host, got)
-		}
+// With no server name and no token referer, the target's own origin is the last
+// resort — the safe "same-site" shape.
+func TestNoServerAndNoRefererUsesTargetOrigin(t *testing.T) {
+	h, _ := headersFor(t, "https://cdn.example/x.m3u8", "", "")
+	if got := h.Get("Origin"); got != "https://cdn.example" {
+		t.Fatalf("Origin = %q, want the target's own origin", got)
+	}
+	if got := h.Get("Referer"); got != "https://cdn.example/" {
+		t.Fatalf("Referer = %q, want the target's own origin", got)
 	}
 }
 

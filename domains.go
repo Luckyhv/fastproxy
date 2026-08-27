@@ -82,66 +82,27 @@ var servers = map[string]upstreamIdentity{
 	"megg": {origin: "https://www.animegg.org", referer: "https://www.animegg.org/"},
 }
 
-// hostAliases maps a CDN host suffix back to its provider, for the two cases
-// where a request arrives without a server name:
+// lookupServer resolves the provider identity from the server name the API put
+// in the token. That name is the only key: the API attaches it to every source
+// it proxifies, so there is nothing to guess from the hostname — and guessing
+// was never reliable anyway, since a CDN's hosts rotate (owocdn.top cycles
+// vault-N subdomains and swaps its apex domain) while the provider name doesn't.
 //
-//   - tokens minted before the API sent one. These outlive a deploy: the API
-//     caches proxified sources (tokens and all) in Redis for a week.
-//   - an upstream redirect that lands on a provider's CDN from somewhere else.
-//
-// Deliberately tiny: only the CDNs we actually serve. This used to be ~30
-// regexp groups copied from another proxy, covering providers this codebase has
-// no scraper for — dead config that still had to be scanned and cached per
-// hostname. Suffix matching on a handful of entries is both faster and honest
-// about what we support.
-var hostAliases = map[string]string{
-	"owocdn.top":   "uwu",
-	"uwucdn.top":   "uwu",
-	"anidb.app":    "kiwi",
-	"echovideo.to": "wave",
-	"echovideo.ru": "wave",
-	"echovideo.cc": "wave",
-	"vidcache.net": "megg",
-	"animegg.org":  "megg",
-}
-
-// lookupServer resolves the provider identity for a request. The server name the
-// API sent wins; otherwise we match the CDN hostname against hostAliases,
-// including subdomains ("vault-12.owocdn.top" → "owocdn.top" → uwu).
-func lookupServer(host, server string) (upstreamIdentity, bool) {
-	if server != "" {
-		if id, ok := servers[strings.ToLower(strings.TrimSpace(server))]; ok {
-			return id, true
-		}
+// An unknown or absent name is not an error: the caller falls back to the token
+// referer, which is the correct identity for every provider not listed above.
+func lookupServer(server string) (upstreamIdentity, bool) {
+	if server == "" {
+		return upstreamIdentity{}, false
 	}
-
-	host = strings.ToLower(host)
-	// Walk the label boundaries instead of scanning the whole table: "a.b.c.d"
-	// checks "a.b.c.d", "b.c.d", "c.d". At most a few map lookups, no regexp, no
-	// per-hostname cache to grow unbounded.
-	for {
-		if name, ok := hostAliases[host]; ok {
-			// An alias pointing at a provider we don't define would otherwise
-			// return a zero identity and blank out Origin/Referer entirely —
-			// worse than falling through to the token referer.
-			if id, ok := servers[name]; ok {
-				return id, true
-			}
-			return upstreamIdentity{}, false
-		}
-		dot := strings.IndexByte(host, '.')
-		if dot < 0 {
-			return upstreamIdentity{}, false
-		}
-		host = host[dot+1:]
-	}
+	id, ok := servers[strings.ToLower(strings.TrimSpace(server))]
+	return id, ok
 }
 
 // applyUpstreamHeaders stamps the browser baseline plus the Origin/Referer this
 // upstream demands, and reports whether it must be spoken to over HTTP/2.
 //
 // Precedence for Origin/Referer:
-//  1. the provider identity (server name, then CDN hostname)
+//  1. the provider identity the server name selects
 //  2. the referer carried in the token — whatever the scraper reported
 //  3. the target's own origin — the safe "same-site" shape
 //
@@ -159,7 +120,7 @@ func applyUpstreamHeaders(req *http.Request, target *url.URL, tokenReferer, serv
 		h[k] = v
 	}
 
-	if id, ok := lookupServer(target.Hostname(), server); ok {
+	if id, ok := lookupServer(server); ok {
 		h.Set("Origin", id.origin)
 		h.Set("Referer", id.referer)
 		if id.noCache {
