@@ -51,3 +51,37 @@ func TestMpegTSContentTypeCorrectsMislabeledSegments(t *testing.T) {
 		t.Fatalf("unsniffed = %q, want no override", got)
 	}
 }
+
+// headersToForward is copied with direct map indexing, which only matches when
+// the keys are in Go's canonical form. "ETag" (the spelling everyone reaches
+// for) canonicalizes to "Etag" and would silently never be forwarded.
+func TestHeadersToForwardAreCanonical(t *testing.T) {
+	for _, k := range headersToForward {
+		if got := http.CanonicalHeaderKey(k); got != k {
+			t.Errorf("headersToForward has non-canonical key %q; use %q", k, got)
+		}
+	}
+}
+
+func TestMaskedContentType(t *testing.T) {
+	if !maskSegmentType {
+		t.Fatal("masking should be ON by default (MASK_SEGMENT_TYPE=0 disables)")
+	}
+	cases := []struct {
+		name, ct, want string
+		status         int
+	}{
+		{"ts segment masked", "video/mp2t", "image/jpeg", 200},
+		{"range response masked", "video/mp4", "image/jpeg", 206},
+		{"already an image", "image/jpeg", "image/jpeg", 200},
+		{"manifest type untouched", "application/vnd.apple.mpegurl", "application/vnd.apple.mpegurl", 200},
+		{"error body untouched", "video/mp2t", "video/mp2t", 403},
+		{"html untouched", "text/html", "text/html", 200},
+		{"empty untouched", "", "", 200},
+	}
+	for _, c := range cases {
+		if got := maskedContentType(c.ct, c.status); got != c.want {
+			t.Errorf("%s: maskedContentType(%q, %d) = %q, want %q", c.name, c.ct, c.status, got, c.want)
+		}
+	}
+}

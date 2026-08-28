@@ -173,22 +173,29 @@ func mpegTSContentType(sniffed []byte, declared string) string {
 	return "video/mp2t"
 }
 
+// responseContentType corrects the one content-type a provider is known to lie
+// about, and otherwise reports what upstream said. The cheap suffix test comes
+// first so the common case never lowercases anything: this runs on every
+// segment, and two throwaway lowercase copies per request is garbage we can
+// simply not create.
 func responseContentType(host, path string, h http.Header) string {
 	ct := h.Get("Content-Type")
-	lowerHost := strings.ToLower(host)
-	lowerPath := strings.ToLower(path)
-	if strings.HasSuffix(lowerPath, ".xls") &&
-		(lowerHost == "hls.anidb.app" || strings.HasSuffix(lowerHost, ".anidb.app")) {
+	if hasSuffixFold(path, ".xls") &&
+		(strings.EqualFold(host, "hls.anidb.app") || hasSuffixFold(host, ".anidb.app")) {
 		return "video/mp2t"
 	}
 	return ct
 }
 
-// Cache policies. We set THREE headers so each layer obeys independently:
+// Cache policies. Every one of them already says what the browser gets AND what
+// the edge gets, in the one header built for it: max-age is the browser's TTL,
+// s-maxage is the shared-cache TTL that Cloudflare and every other CDN reads.
 //
-//	Cache-Control            -> the browser
-//	CDN-Cache-Control        -> standards-compliant CDNs (Fastly, etc.)
-//	Cloudflare-CDN-Cache-Control -> Cloudflare specifically
+// We used to also emit CDN-Cache-Control and Cloudflare-CDN-Cache-Control. Those
+// exist to give the edge a DIFFERENT policy than the browser — and we were
+// sending all three byte-identical, so the extra two decided nothing and just
+// added ~120 bytes to every segment response. If a policy ever needs to diverge
+// per layer, that is the moment to bring them back, not before.
 const (
 	immutableForever = "public, max-age=31536000, s-maxage=31536000, immutable"
 	manifestPolicy   = "public, max-age=300, s-maxage=14400" // browser 5m, edge 4h
@@ -196,11 +203,8 @@ const (
 	noStore          = "no-store"
 )
 
-// setCC writes the same cache policy to all three header families.
 func setCC(h http.Header, policy string) {
 	h.Set("Cache-Control", policy)
-	h.Set("CDN-Cache-Control", policy)
-	h.Set("Cloudflare-CDN-Cache-Control", policy)
 }
 
 // setAssetCache picks a policy for a streamed (non-manifest) response.
@@ -228,4 +232,43 @@ func setAssetCache(h http.Header, path string, status int, contentType string) {
 		// full 200 of a media asset (by extension OR content-type)
 		setCC(h, immutableForever)
 	}
+}
+
+// maskSegmentType, when MASK_SEGMENT_TYPE=1, rewrites the outgoing Content-Type
+// of media segments to image/jpeg so they read as static assets to anything
+// classifying traffic by MIME (CDN video-ToS scanners, ISP DPI).
+//
+// This is PURELY a masquerade for middleboxes. It buys nothing on caching —
+// setAssetCache already marks video/* and mp2t immutable-forever, and our path
+// tokens are deterministic, so segments are already one shared edge object.
+//
+// ON by default (MASK_SEGMENT_TYPE=0 disables it). The known risk: it undoes
+// mpegTSContentType (commit 6c28fa7). hls.js reads segment types from the
+// manifest and ignores the response type entirely, so it is unaffected — but
+// Safari/iOS native HLS goes through AVFoundation, which is stricter about the
+// declared type. If iOS fullscreen playback regresses, that is the first knob
+// to turn off.
+//
+// Manifests are never masked: they are served by serveManifest, which sets
+// application/vnd.apple.mpegurl and never consults this.
+var maskSegmentType = getenv("MASK_SEGMENT_TYPE", "1") != "0"
+
+// maskedContentType returns the type to advertise downstream. It masks only real
+// media bodies: an error page or a manifest must keep its true type, and the
+// cache policy must already have been decided from the TRUE type before this is
+// applied.
+func maskedContentType(ct string, status int) string {
+	if !maskSegmentType || ct == "" {
+		return ct
+	}
+	if status != http.StatusOK && status != http.StatusPartialContent {
+		return ct // never disguise an error body
+	}
+	if !isCacheableContentType(ct) {
+		return ct // not media; leave it alone
+	}
+	if strings.HasPrefix(strings.ToLower(ct), "image/") {
+		return ct // already an image type
+	}
+	return "image/jpeg"
 }
