@@ -14,9 +14,15 @@ func isM3U8ContentType(ct string) bool {
 	return strings.Contains(ct, "mpegurl") || strings.Contains(ct, "vnd.apple.mpegurl")
 }
 
+// hasSuffixFold is strings.HasSuffix, case-insensitively, without the ToLower
+// allocation. It runs once per playlist line in the rewrite loop, so the
+// throwaway lowercase copy it replaces was real garbage on every manifest.
+func hasSuffixFold(s, suffix string) bool {
+	return len(s) >= len(suffix) && strings.EqualFold(s[len(s)-len(suffix):], suffix)
+}
+
 func isM3U8Path(p string) bool {
-	p = strings.ToLower(p)
-	return strings.HasSuffix(p, ".m3u8") || strings.HasSuffix(p, ".m3u")
+	return hasSuffixFold(p, ".m3u8") || hasSuffixFold(p, ".m3u")
 }
 
 // isM3U8URL also looks at the query string. Some hosts park the extension there
@@ -24,6 +30,21 @@ func isM3U8Path(p string) bool {
 // alone looks like an opaque blob.
 func isM3U8URL(u *url.URL) bool {
 	return isM3U8Path(u.Path) || isM3U8Path(u.RawQuery)
+}
+
+// isM3U8Ref is isM3U8URL on a RAW uri string, for the rewrite loop. It answers
+// the same question without url.Parse — which the loop was paying for on every
+// single line of every playlist, purely to pick between two path prefixes.
+// Splitting off the fragment and query by hand is exact here: both extensions
+// we look for are suffixes, so where the string ends is all that matters.
+func isM3U8Ref(ref string) bool {
+	if i := strings.IndexByte(ref, '#'); i >= 0 {
+		ref = ref[:i]
+	}
+	if i := strings.IndexByte(ref, '?'); i >= 0 {
+		return isM3U8Path(ref[:i]) || isM3U8Path(ref[i+1:])
+	}
+	return isM3U8Path(ref)
 }
 
 // resolve turns a (possibly relative) URI from inside a manifest into an
@@ -61,6 +82,12 @@ func absoluteURI(ref string, base *url.URL) string {
 	return resolve(ref, base).String()
 }
 
+// perLineOverhead is what a rewritten line costs on top of its source text: our
+// origin and route prefix, plus base64 (4/3) of the absolute URL and referer the
+// token carries. Deliberately generous — over-reserving a manifest by a few tens
+// of KB is cheaper than one realloc-and-copy of the whole buffer.
+const perLineOverhead = 320
+
 // rewritePlaylist walks an HLS manifest line by line and rewrites every child
 // URL so the player fetches it back through us. `encode` maps an upstream URI
 // (already made absolute) to a local proxy path, with the referer and server
@@ -71,10 +98,12 @@ func absoluteURI(ref string, base *url.URL) string {
 // every one of them before writing a single byte.
 func rewritePlaylist(body []byte, base *url.URL, encode func(string) string) []byte {
 	var out bytes.Buffer
-	// Proxy paths are base64 of (url + referer + server), so a rewritten line
-	// runs ~1.4x its source plus the /stream/ prefix. 2x covers it without a
-	// realloc on any real playlist.
-	out.Grow(len(body) * 2)
+	// A rewritten line is base64(absolute url + referer + server) behind our own
+	// origin, so its length tracks the ENCODED payload, not the source line — a
+	// playlist of short relative names ("seg-0001.ts") can grow 20x. Size from the
+	// real per-line cost instead of a flat multiple of the body, so a big playlist
+	// doesn't re-grow (and re-copy) a few hundred KB several times over.
+	out.Grow(len(body) + bytes.Count(body, []byte("\n"))*perLineOverhead)
 
 	// Mirrors bytes.Split exactly: a body ending in "\n" has a final empty line,
 	// so the trailing newline survives the round trip. Driving the loop off
