@@ -36,6 +36,8 @@ Or generate a token link (XOR+base64url, compatible with the Bun proxy / fronten
 | `MAX_CONCURRENT` | `0` | max simultaneous streams (0 = unlimited); excess gets `503` |
 | `INSECURE_TLS` | _(off)_ | `1` to skip upstream cert verification (sketchy CDNs only) |
 | `ALLOW_RAW_URL` | `1` | `0` to disable `?url=` mode and require XOR tokens |
+| `MAX_IDLE_CONNS` | _(auto)_ | total pooled upstream connections; auto-sized from RAM (min 1000) |
+| `MAX_IDLE_CONNS_PER_HOST` | _(auto)_ | pooled connections per CDN host; defaults to a quarter of the total |
 
 ## What it does
 
@@ -45,6 +47,27 @@ Or generate a token link (XOR+base64url, compatible with the Bun proxy / fronten
 - Follows 3xx redirects server-side (up to 5 hops, SSRF-checked per hop) — no extra client round-trip per segment; POST falls back to a re-wrapped client redirect.
 - Forwards conditional headers (`If-None-Match` etc.) so 304 revalidation works end-to-end.
 - Wildcard CORS (no credentials/Vary) + cache headers tuned per kind: segments immutable-forever, master/VOD playlists 5m browser / 4h edge, live playlists ~2s → CDN-friendly without freezing live streams.
+
+## Throughput notes
+
+Two things dominate how much video one box can push, and both are easy to get
+silently wrong:
+
+- **The copy runs through `writerOnly{w}`, not `w` directly.** `io.CopyBuffer`
+  ignores the buffer you give it when the destination implements
+  `io.ReaderFrom` — and `net/http`'s ResponseWriter does. Passing the
+  ResponseWriter bare meant the 1 MB pooled buffer was never touched and every
+  transfer ran at 32 KB. Hiding the shortcut is worth +31% on a 4 MB segment
+  and +52% on a 32 MB file (`go test -bench Stream`), and gives up nothing:
+  sendfile/splice can never fire with an HTTP response body as the source.
+- **The per-host idle-connection cap is the one that bites.** Every viewer pulls
+  from the same handful of CDN hostnames, so one pool entry carries the whole
+  box. Above the cap, Go closes connections instead of parking them and the next
+  segment pays a fresh TCP + TLS handshake. `autoTune()` sizes this at startup.
+
+```sh
+go test -bench . -benchmem     # stream copy + manifest rewrite
+```
 
 ## Scaling
 
