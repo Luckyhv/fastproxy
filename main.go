@@ -29,6 +29,12 @@ func main() {
 		return
 	}
 
+	if egressErr != nil {
+		log.Fatal(egressErr)
+	}
+	log.Printf("egress: %d configured proxies", len(egress.proxies))
+	go logUpstreamStats(time.Minute)
+
 	// Detect cores + RAM and size runtime defaults (GOMAXPROCS, MAX_CONCURRENT).
 	autoTune()
 

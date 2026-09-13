@@ -28,14 +28,18 @@ func isPublicHost(host string) bool {
 	return true // hostname — dialControl validates the resolved IP
 }
 
-// bufPool hands out 1 MB scratch buffers and takes them back when a stream ends,
+// bufPool hands out configurable scratch buffers and reuses them across streams.
+// The default is 256 KiB to reduce memory pressure on small VPS instances.
+// It takes them back when a stream ends,
 // so we don't allocate (and then garbage-collect) a fresh buffer for every
 // request. Buffer size is a knob: smaller = less RAM per concurrent stream (more
-// viewers per box), larger = fewer read/write syscalls (more throughput per big
-// file). 1 MB favors throughput; autoTune()'s perStreamBudget is sized to match.
+// viewers per box), larger = potentially fewer syscalls for big files.
+// autoTune() accounts for the selected size.
+var streamBufferSize = max(32, min(atoiDefault(getenv("STREAM_BUFFER_KB", "256"), 256), 1024)) * 1024
+
 var bufPool = sync.Pool{
 	New: func() any {
-		b := make([]byte, 1024*1024) // 1 MB
+		b := make([]byte, streamBufferSize)
 		return &b
 	},
 }
@@ -70,24 +74,9 @@ type readerCloser struct {
 	io.Closer
 }
 
-// writerOnly hides every method of a ResponseWriter except Write.
-//
-// This is load-bearing, not cosmetic. io.CopyBuffer only uses the buffer you
-// hand it when NEITHER side offers a shortcut: if the destination implements
-// io.ReaderFrom it calls dst.ReadFrom(src) and DROPS the buffer on the floor.
-// net/http's *response does implement ReaderFrom, so a bare
-// io.CopyBuffer(w, body, oneMegBuffer) silently ignored our 1 MB buffer and ran
-// the transfer through net/http's internal 32 KB one — and for a non-chunked
-// response it went further, to net.TCPConn.ReadFrom, which (with an HTTP body
-// as src, so neither splice nor sendfile can apply) falls back to io.Copy and
-// allocates yet another 32 KB buffer per stream.
-//
-// That ReaderFrom shortcut exists to reach sendfile/splice, and neither can
-// ever fire here: our source is an HTTP response body, not a file or a raw TCP
-// socket. So hiding it costs nothing and buys 32x larger reads and writes:
-// +31% on a 4 MB segment and +52% on a 32 MB file over loopback, where the
-// network is free — see BenchmarkStreamReaderFrom vs BenchmarkStreamPooledBuf.
-// On a real path the win shows up as CPU per byte, i.e. streams per box.
+// Hide ResponseWriter.ReadFrom so io.CopyBuffer actually uses our pooled buffer
+// instead of net/http's fallback buffer. The source is an HTTP body, so this
+// does not disable a usable sendfile/splice path.
 type writerOnly struct{ io.Writer }
 
 // knownRoutes are the path prefixes the player will hit. The encrypted token is
@@ -149,7 +138,7 @@ func proxyURLFor(r *http.Request, targetURL, referer, server string) string {
 }
 
 func serveManifest(w http.ResponseWriter, r *http.Request, resp *http.Response, base *url.URL, referer, server string) {
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize+1))
 	if err != nil {
 		http.Error(w, "manifest read failed", http.StatusBadGateway)
 		return
@@ -171,11 +160,19 @@ func serveManifest(w http.ResponseWriter, r *http.Request, resp *http.Response, 
 		}
 		setCC(w.Header(), noStore) // not a playlist and not a known asset — don't pin it
 		w.WriteHeader(resp.StatusCode)
-		if _, err := w.Write(body); err == nil && len(body) == maxManifestSize {
+		if _, err := w.Write(body); err == nil && len(body) > maxManifestSize {
 			buf := bufPool.Get().(*[]byte)
 			defer bufPool.Put(buf)
-			_, _ = io.CopyBuffer(writerOnly{w}, resp.Body, *buf)
+			if _, err := io.CopyBuffer(writerOnly{w}, resp.Body, *buf); err != nil {
+				panic(http.ErrAbortHandler)
+			}
 		}
+		return
+	}
+
+	if len(body) > maxManifestSize {
+		setCC(w.Header(), noStore)
+		http.Error(w, "manifest too large", http.StatusBadGateway)
 		return
 	}
 
@@ -225,18 +222,23 @@ func rawURLQuery(r *http.Request) url.Values {
 }
 
 // inFlight optionally caps how many streams we serve at once. Backpressure
-// already bounds RAM per stream (~1 MB buffer), but a hard ceiling protects
+// already bounds RAM per stream (256 KiB default buffer), but a hard ceiling protects
 // against running out of file descriptors / sockets under a stampede. It is
 // sized by autoTune() at startup (from MAX_CONCURRENT, or derived from detected
-// RAM). nil = unlimited. When full we shed load with 503 rather than queueing.
+// RAM). nil = unlimited. At capacity, return an uncached 503 with Retry-After.
 var inFlight chan struct{}
 
 func handleProxy(w http.ResponseWriter, r *http.Request) {
+	setCC(w.Header(), noStore)
+	if r.Context().Err() != nil {
+		return
+	}
 	if inFlight != nil {
 		select {
-		case inFlight <- struct{}{}: // got a slot
+		case inFlight <- struct{}{}:
 			defer func() { <-inFlight }()
 		default:
+			w.Header().Set("Retry-After", "1")
 			http.Error(w, "server busy", http.StatusServiceUnavailable)
 			return
 		}
@@ -340,7 +342,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// 4. Fire the upstream fetch. resp.Body is a STREAM, not the full payload —
 	//    nothing has been downloaded into memory yet at this line.
-	resp, err := client.Do(req)
+	viewer := clientIP(r)
+	resp, err := fetchUpstream(client, req, server, viewer)
 	if err != nil {
 		http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 		return
@@ -369,7 +372,7 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 		nreq.Header = req.Header // same forged headers on every hop
 		req = nreq
-		resp, err = client.Do(req)
+		resp, err = fetchUpstream(client, req, server, viewer)
 		if err != nil {
 			http.Error(w, "upstream fetch failed", http.StatusBadGateway)
 			return
@@ -386,6 +389,14 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, proxyURLFor(r, abs.String(), referer, server), resp.StatusCode)
 			return
 		}
+	}
+
+	if retry := resp.Header.Get("Retry-After"); retry != "" {
+		w.Header().Set("Retry-After", retry)
+	}
+	if resp.Header.Get("Cf-Mitigated") == "challenge" {
+		http.Error(w, "upstream challenge", http.StatusBadGateway)
+		return
 	}
 
 	// 4b. Is this an HLS manifest? If so, we must read it, rewrite every child
@@ -411,13 +422,13 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			// Only the manifest path needs the peeked bytes stitched back onto
 			// the reader, because serveManifest reads the body as one unit. The
 			// streaming path deliberately does NOT get a MultiReader: that
-			// wrapper would sit in front of every 1 MB read for the whole
+			// wrapper would sit in front of every buffered read for the whole
 			// transfer to replay 7 bytes it already handed back. It writes the
 			// prefix once itself instead (step 7 below).
 			resp.Body = readerCloser{io.MultiReader(bytes.NewReader(sniffed), resp.Body), resp.Body}
 		}
 	}
-	if isManifest {
+	if isManifest && r.Method != http.MethodHead && resp.StatusCode == http.StatusOK {
 		serveManifest(w, r, resp, target, referer, server)
 		return
 	}
@@ -445,6 +456,15 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	}
 	// Cache policy is decided from the TRUE content-type, BEFORE any masquerade —
 	// masking must never be able to change what the edge stores or for how long.
+	if resp.StatusCode == http.StatusNotModified {
+		// Preserve the cached object's existing freshness on revalidation.
+		out.Del("Cache-Control")
+	}
+	if isManifest && r.Method == http.MethodHead {
+		// GET rewrites the representation, so the origin length/ETag do not apply.
+		out.Del("Content-Length")
+		out.Del("Etag")
+	}
 	setAssetCache(out, target.Path, resp.StatusCode, ct)
 	// Last step: optionally advertise media as image/jpeg (MASK_SEGMENT_TYPE=1).
 	if masked := maskedContentType(ct, resp.StatusCode); masked != "" {
@@ -455,12 +475,12 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(resp.StatusCode)
 
 	// A HEAD request wants headers only — never a body.
-	if r.Method == http.MethodHead {
+	if r.Method == http.MethodHead || resp.StatusCode == http.StatusNotModified {
 		return
 	}
 
 	// 7. THE BACKPRESSURED COPY — the heart of the whole thing.
-	//    io.CopyBuffer does: read up to 1 MB from upstream -> write it to the
+	//    io.CopyBuffer does: read up to the configured buffer size from upstream -> write it to the
 	//    client -> repeat. The write BLOCKS until the client's TCP send buffer
 	//    has room. A slow viewer therefore slows our reads from upstream, so at
 	//    most ~one buffer is in flight per connection — RAM stays bounded (flat)
@@ -477,11 +497,15 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
 	_, err = io.CopyBuffer(writerOnly{w}, resp.Body, *buf)
-	if err != nil && !isClientGone(err) {
-		// Only log genuine failures — client disconnects (seek/close) are normal
-		// for video and would otherwise spam the log on every interaction.
-		log.Printf("stream error: %v", err)
+	if err != nil {
+		if !isClientGone(err) {
+			log.Printf("stream error: %v", err)
+		}
+		// Abort even for a reset: it may have come from the upstream, not the
+		// viewer. A clean chunked EOF would let caches store a truncated segment.
+		panic(http.ErrAbortHandler)
 	}
+
 }
 
 // isClientGone reports whether a copy error is just the viewer disconnecting
