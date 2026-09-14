@@ -5,59 +5,60 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 )
 
-// perStreamBudget is the RAM we conservatively reserve per concurrent stream when
-// auto-deriving MAX_CONCURRENT. The live copy buffer is 1 MB (see bufPool), plus
-// net/http read/write buffers, TLS state, and the upstream side — so we budget
-// ~1.5 MB to stay safe under real traffic. Bigger buffer = fewer concurrent
-// streams auto-allowed, which is correct.
-const perStreamBudget = 1536 * 1024
+// perStreamBudget is the RAM reserved per concurrent stream: the copy buffer plus
+// ~1.25 MiB of net/http buffers, TLS state and the upstream side. Measured Aug
+// 2026 at 2.2–2.35 MiB/viewer with a 1 MiB buffer.
+var perStreamBudget = uint64(streamBufferSize + 1280*1024)
 
-// autoTune inspects the machine/container and picks sane runtime defaults,
-// logging what it found. Explicit env vars (GOMAXPROCS, MAX_CONCURRENT) always
-// win — auto-tuning only fills in what you didn't set.
+// capacityFor derives the in-flight cap from RAM alone: half of memory on
+// streams, the rest for the OS, runtime and spikes. No CPU term — the work is
+// I/O, and a per-core cap only turned real traffic into 503s on small VPSes.
+// 0 = unlimited (RAM undetected, e.g. a macOS dev box).
+func capacityFor(mem uint64) int {
+	if mem == 0 {
+		return 0
+	}
+	return max(64, min(int(mem/2/perStreamBudget), 200000))
+}
+
+// Called once before listening. Recalculate on every process start so moving
+// between VPS/container sizes needs no hand-edited capacity settings.
 func autoTune() {
 	cpus := effectiveCPUs()
 	if os.Getenv("GOMAXPROCS") == "" {
-		runtime.GOMAXPROCS(cpus) // pin to the *effective* core count
+		runtime.GOMAXPROCS(cpus)
 	}
-
-	mem := effectiveMemoryBytes() // 0 = couldn't detect (e.g. macOS dev box)
-
-	switch {
-	case os.Getenv("MAX_CONCURRENT") != "":
-		// Operator set it explicitly — honor it (0 = unlimited).
-		if n := atoiDefault(os.Getenv("MAX_CONCURRENT"), 0); n > 0 {
-			inFlight = make(chan struct{}, n)
-			log.Printf("autotune: MAX_CONCURRENT=%d (explicit)", n)
-		} else {
-			log.Printf("autotune: MAX_CONCURRENT=unlimited (explicit)")
-		}
-	case mem > 0:
-		// Derive a cap from RAM: spend ~half of memory on stream buffers, leave
-		// the rest for the OS, the Go runtime, and traffic spikes. Clamp to a
-		// sane range so tiny or huge boxes still get a reasonable number.
-		n := int((mem / 2) / perStreamBudget)
-		if n < 100 {
-			n = 100
-		}
-		if n > 200000 {
-			n = 200000
-		}
-		inFlight = make(chan struct{}, n)
-		log.Printf("autotune: MAX_CONCURRENT=%d (derived from %s RAM)", n, humanBytes(mem))
-	default:
-		log.Printf("autotune: MAX_CONCURRENT=unlimited (RAM undetected; set it explicitly to cap)")
-	}
-
-	// Size the upstream connection pools from the same memory picture. Safe to
-	// mutate the live transports here: this runs before the listener starts.
+	cpus = min(cpus, runtime.GOMAXPROCS(0))
+	mem := effectiveMemoryBytes()
+	tuneConcurrency(mem)
 	tuneTransports(mem)
-
+	if mem > 0 && os.Getenv("GOMEMLIMIT") == "" {
+		// Soft Go-runtime target; excludes kernel socket buffers and other processes.
+		limit := int64(min(mem/10*7, uint64(1<<63-1)))
+		debug.SetMemoryLimit(limit)
+		log.Printf("autotune: Go memory target=%s (soft limit)", humanBytes(uint64(limit)))
+	}
 	log.Printf("autotune: cpus=%d (GOMAXPROCS=%d), ram=%s", cpus, runtime.GOMAXPROCS(0), humanBytes(mem))
+}
+
+func tuneConcurrency(mem uint64) {
+	capacity := capacityFor(mem)
+	if raw := getenv("MAX_CONCURRENT", ""); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 {
+			capacity = n
+		}
+	}
+	if capacity == 0 {
+		inFlight = nil
+	} else {
+		inFlight = make(chan struct{}, capacity)
+	}
+	log.Printf("autotune: active requests=%d (0=unlimited)", capacity)
 }
 
 // effectiveCPUs returns the smaller of the host core count and any cgroup CPU

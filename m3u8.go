@@ -103,7 +103,7 @@ func rewritePlaylist(body []byte, base *url.URL, encode func(string) string) []b
 	// playlist of short relative names ("seg-0001.ts") can grow 20x. Size from the
 	// real per-line cost instead of a flat multiple of the body, so a big playlist
 	// doesn't re-grow (and re-copy) a few hundred KB several times over.
-	out.Grow(len(body) + bytes.Count(body, []byte("\n"))*perLineOverhead)
+	out.Grow(min(len(body)+bytes.Count(body, []byte("\n"))*perLineOverhead, maxManifestSize))
 
 	// Mirrors bytes.Split exactly: a body ending in "\n" has a final empty line,
 	// so the trailing newline survives the round trip. Driving the loop off

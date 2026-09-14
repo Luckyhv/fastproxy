@@ -1,14 +1,20 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // isM3U8Ref replaces a url.Parse + isM3U8URL round trip in the rewrite loop, so
@@ -98,21 +104,18 @@ func TestProxyURLForMatchesHoistedForm(t *testing.T) {
 	}
 }
 
-// tuneTransports must never shrink the pool below the shipped defaults, and must
-// honour the memory ceiling.
+// tuneTransports keeps defaults when RAM is unknown and grows for larger hosts.
 func TestTuneTransports(t *testing.T) {
 	defer tuneTransports(0) // restore defaults for other tests
 
-	// Undetected RAM keeps the shipped total. The per-host share still rises to a
-	// quarter of it, which costs no extra memory (the total is the RAM ceiling)
-	// and is the cap that actually throttles a single busy CDN.
+	// Unknown RAM keeps the default total pool; one busy CDN may park half of it.
 	tuneTransports(0)
 	tr := httpClient.Transport.(*http.Transport)
 	if tr.MaxIdleConns != defaultMaxIdleConns {
 		t.Fatalf("undetected RAM should keep the default total, got %d", tr.MaxIdleConns)
 	}
-	if tr.MaxIdleConnsPerHost != defaultMaxIdleConns/4 {
-		t.Fatalf("per-host share = %d, want %d", tr.MaxIdleConnsPerHost, defaultMaxIdleConns/4)
+	if tr.MaxIdleConnsPerHost != defaultMaxIdleConns/2 || tr.MaxConnsPerHost != 0 {
+		t.Fatalf("per-host idle=%d active=%d, want %d and unlimited", tr.MaxIdleConnsPerHost, tr.MaxConnsPerHost, defaultMaxIdleConns/2)
 	}
 
 	tuneTransports(64 << 30) // 64 GiB
@@ -122,7 +125,7 @@ func TestTuneTransports(t *testing.T) {
 	if tr.MaxIdleConns > maxIdleConnsCap {
 		t.Fatalf("pool exceeded the cap: %d", tr.MaxIdleConns)
 	}
-	if tr.MaxIdleConnsPerHost < defaultMaxIdleConnsPerHost {
+	if tr.MaxIdleConnsPerHost < 64 {
 		t.Fatalf("per-host cap regressed below the default: %d", tr.MaxIdleConnsPerHost)
 	}
 	if h2 := h2Client.Transport.(*http.Transport); h2.MaxIdleConns != tr.MaxIdleConns {
@@ -179,5 +182,131 @@ func TestWriterOnlyCopyIsByteExact(t *testing.T) {
 	}
 	if sha256.Sum256(got) != want {
 		t.Fatal("body corrupted in transit")
+	}
+}
+
+func isolateCapacity(t *testing.T) {
+	t.Helper()
+	slots := inFlight
+	t.Cleanup(func() { inFlight = slots; tuneTransports(0) })
+	for _, k := range []string{"MAX_CONCURRENT", "MAX_CONNS_PER_HOST", "MAX_IDLE_CONNS", "MAX_IDLE_CONNS_PER_HOST"} {
+		t.Setenv(k, "")
+	}
+}
+func TestCapacityMovesWithServer(t *testing.T) {
+	isolateCapacity(t)
+	for _, tc := range []struct {
+		ram  uint64
+		want int
+	}{{4 << 30, 1365}, {8 << 30, 2730}, {512 << 20, 170}, {0, 0}, {64 << 20, 64}} {
+		tuneConcurrency(tc.ram)
+		tuneTransports(tc.ram)
+		if cap(inFlight) != tc.want {
+			t.Fatalf("ram=%d capacity=%d want=%d", tc.ram, cap(inFlight), tc.want)
+		}
+		for _, c := range []*http.Client{httpClient, h2Client} {
+			tr := c.Transport.(*http.Transport)
+			if tr.MaxConnsPerHost != 0 {
+				t.Fatal("host cap must default to unlimited")
+			}
+			if tr.MaxIdleConnsPerHost > tr.MaxIdleConns {
+				t.Fatal("idle host exceeds total")
+			}
+		}
+	}
+}
+func TestCapacityOverridesAndReset(t *testing.T) {
+	isolateCapacity(t)
+	t.Setenv("MAX_CONCURRENT", "100")
+	t.Setenv("MAX_CONNS_PER_HOST", "25")
+	tuneConcurrency(4 << 30)
+	tuneTransports(4 << 30)
+	if cap(inFlight) != 100 || httpClient.Transport.(*http.Transport).MaxConnsPerHost != 25 {
+		t.Fatal("operator overrides ignored")
+	}
+	t.Setenv("MAX_CONCURRENT", "0")
+	t.Setenv("MAX_CONNS_PER_HOST", "0")
+	tuneConcurrency(4 << 30)
+	tuneTransports(4 << 30)
+	if inFlight != nil || httpClient.Transport.(*http.Transport).MaxConnsPerHost != 0 {
+		t.Fatal("explicit unlimited ignored")
+	}
+	t.Setenv("MAX_CONCURRENT", "invalid")
+	t.Setenv("MAX_CONNS_PER_HOST", "invalid")
+	tuneConcurrency(4 << 30)
+	tuneTransports(4 << 30)
+	if cap(inFlight) != 1365 || httpClient.Transport.(*http.Transport).MaxConnsPerHost != 0 {
+		t.Fatal("invalid settings should retain safe auto defaults")
+	}
+}
+
+// More than 64 simultaneous reads must reach one upstream host before it sends
+// any response. This would deadlock behind the former fixed 64-connection cap.
+func TestMinimumVPSConcurrentBurst(t *testing.T) {
+	isolateCapacity(t)
+	old := httpClient
+	httpClient = newClient(false)
+	defer func() { httpClient.Transport.(*http.Transport).CloseIdleConnections(); httpClient = old }()
+	tuneConcurrency(4 << 30)
+	tuneTransports(4 << 30)
+	const count = 96
+	gate := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	defer release()
+	var arrived atomic.Int32
+	ready := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if arrived.Add(1) == count {
+			close(ready)
+		}
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			return
+		}
+		w.Header().Set("Content-Type", "video/mp2t")
+		_, _ = io.WriteString(w, "segment")
+	}))
+	defer origin.Close()
+	tr := httpClient.Transport.(*http.Transport)
+	tr.Proxy = nil
+	tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(handleProxy))
+	defer proxy.Close()
+	client := &http.Client{Timeout: 10 * time.Second}
+	defer client.CloseIdleConnections()
+	target := proxy.URL + "/stream/" + EncodePayload("http://cdn.test/seg.ts", "", "")
+	results := make(chan error, count)
+	for i := 0; i < count; i++ {
+		go func() {
+			resp, err := client.Get(target)
+			if err != nil {
+				results <- err
+				return
+			}
+			b, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if err == nil && (resp.StatusCode != 200 || string(b) != "segment") {
+				err = fmt.Errorf("status=%d body=%q", resp.StatusCode, b)
+			}
+			results <- err
+		}()
+	}
+	select {
+	case <-ready:
+	case <-time.After(5 * time.Second):
+		t.Errorf("only %d of %d requests reached upstream concurrently", arrived.Load(), count)
+	}
+	release()
+	for i := 0; i < count; i++ {
+		if err := <-results; err != nil {
+			t.Error(err)
+		}
+	}
+	if len(inFlight) != 0 {
+		t.Fatal("request capacity leaked")
 	}
 }
