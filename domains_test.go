@@ -3,6 +3,8 @@ package main
 import (
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -192,5 +194,50 @@ func TestBaselineIsNotMutatedAcrossRequests(t *testing.T) {
 	}
 	if defaultHeaders.Get("Origin") != "" {
 		t.Fatal("defaultHeaders picked up a per-request Origin")
+	}
+}
+
+func TestEgressConfig(t *testing.T) {
+	for _, k := range []string{"UPSTREAM_PROXY", "UPSTREAM_PROXIES", "UPSTREAM_PROXY_FILE", "UPSTREAM_PROXY_SERVERS", "UPSTREAM_PROXY_DOMAINS"} {
+		t.Setenv(k, "")
+	}
+	t.Setenv("UPSTREAM_PROXIES", "http://user:secret@proxy.test:8080,http://user:secret@proxy.test:8080,socks5://other.test:1080")
+	c, err := loadEgress()
+	if err != nil || len(c.proxies) != 2 {
+		t.Fatalf("load: %d %v", len(c.proxies), err)
+	}
+	if c.forced("a.test", "uwu") {
+		t.Fatal("no filters must go direct first")
+	}
+	c.servers = []string{"*"}
+	if !c.forced("a.test", "") {
+		t.Fatal("* must proxy everything")
+	}
+	c.servers = []string{"uwu"}
+	if !c.forced("a.test", "uwu") || c.forced("a.test", "wave") {
+		t.Fatal("server filter")
+	}
+	c.domains = []string{"cdn.test"}
+	if !c.forced("a.cdn.test", "") || c.forced("evilcdn.test", "") {
+		t.Fatal("suffix boundary")
+	}
+	file := filepath.Join(t.TempDir(), "proxies.txt")
+	if err := os.WriteFile(file, []byte("# pool\nhttps://file.test:8443\n\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("UPSTREAM_PROXY_FILE", file)
+	if loaded, err := loadEgress(); err != nil || len(loaded.proxies) != 3 {
+		t.Fatalf("file load: %d %v", len(loaded.proxies), err)
+	}
+	t.Setenv("UPSTREAM_PROXY_FILE", "")
+
+	t.Setenv("UPSTREAM_PROXIES", "ftp://user:secret@proxy.test")
+	if _, err := loadEgress(); err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatal("invalid URL must fail without credentials")
+	}
+	t.Setenv("UPSTREAM_PROXIES", "")
+	t.Setenv("UPSTREAM_PROXY_FILE", "/missing-fastproxy-test-file")
+	if _, err := loadEgress(); err == nil {
+		t.Fatal("missing proxy file silently accepted")
 	}
 }
