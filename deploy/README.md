@@ -152,11 +152,13 @@ sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
 
 ## Caching
 
-You don't need a cache in Caddy. fastproxy sets `immutable` cache headers on
-segments, and **Cloudflare caches them at its edge** — that's the cache layer.
+Use Cloudflare as the cache layer; no extra cache service is required on the VPS.
+Make the proxy routes eligible for caching and respect fastproxy's Cache-Control
+headers. Keep short freshness for live playlists and no-store for errors/partials.
+Preserve full tokens and signed query strings in cache keys. Verify cache behavior
+with CF-Cache-Status: a cacheable repeated request should return HIT rather than
+DYNAMIC. A long forced Edge TTL can override the app's intended freshness.
 
-A local origin cache (the Souin `cache-handler` plugin) only helps on Cloudflare
-cache-misses and requires building Caddy from source with `xcaddy`
-(`xcaddy build --with github.com/caddyserver/cache-handler`) plus a `cache {}`
-block in the Caddyfile. It also reintroduces the on-box memory/disk pressure this
-proxy was written to avoid. Skip it unless you have a measured reason.
+Cache hits bypass fastproxy's frontend Origin allow-list. Enforce required access
+rules at Cloudflare. Leave capacity overrides unset to adapt when moving VPSes;
+see the top-level README for the automatic CPU/RAM settings.

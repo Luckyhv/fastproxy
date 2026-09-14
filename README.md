@@ -1,76 +1,115 @@
 # fastproxy
 
-A Go HLS/mp4 streaming proxy. Built because Bun (`../proxy`) can't bound
-per-stream RAM — under a slow client it buffers the whole asset (~2–3 GB/stream,
-measured), while Go's blocking `io.CopyBuffer` holds backpressure and stays flat
-(~64 KB/stream).
+A small Go HLS/MP4 proxy. Rewrites playlists, streams media with bounded buffers,
+and reuses upstream connections. No external Go dependencies.
 
 ## Run
 
 ```sh
+cp .env.example .env
+# Set the frontend domains and matching SECRET_KEY in .env.
 go build -o fastproxy .
-PORT=3847 SECRET_KEY=aproxy2026 ./fastproxy
+./fastproxy
 ```
 
-Proxy any HLS stream directly (raw-URL mode, no token needed — URL-encode it):
+Raw URL mode: `/stream?url=<URL-encoded-source>&server=uwu&ref=<URL-encoded-referer>`.
+Or generate a frontend-compatible token:
 
 ```sh
-http://localhost:3847/stream?url=https%3A%2F%2Fhost%2Fmaster.m3u8&ref=https%3A%2F%2Freferer.site
+./fastproxy encode "https://cdn.example/master.m3u8" "https://player.example" "uwu"
+# Request /m3u8/<token> (playlists) or /stream/<token> (media).
 ```
 
-Or generate a token link (XOR+base64url, compatible with the Bun proxy / frontend):
+## Optional outbound proxies
+
+```dotenv
+UPSTREAM_PROXY_FILE=./proxies.txt
+UPSTREAM_PROXY_SERVERS=uwu,kiwi,wave
+```
+
+Put one proxy URL per line in `proxies.txt` (git-ignored):
+
+```text
+http://user:password@proxy-one.example:8080
+http://user:password@proxy-two.example:8080
+```
+
+`UPSTREAM_PROXY` accepts one URL; `UPSTREAM_PROXIES` accepts a comma-separated list.
+All sources are combined and deduplicated. Supported schemes: HTTP, HTTPS, SOCKS5,
+SOCKS5H; bare `host:port` means HTTP. Percent-encode special characters in credentials.
+Blank lines and `#` comments are allowed. Invalid settings fail startup without
+logging credentials. Restart after editing the list.
+
+A proxy is roughly 3x slower per segment than a direct fetch, so routing is:
+
+- `UPSTREAM_PROXY_SERVERS` providers and `UPSTREAM_PROXY_DOMAINS` hosts/subdomains
+  always use the pool; `UPSTREAM_PROXY_SERVERS=*` means all traffic. Leave both
+  empty to use the pool only as a 429 fallback (recommended).
+- Every other host goes **direct first**. If it answers 429, that request is
+  replayed through the pool and the host stays proxied for 10 minutes. A 403 is
+  not retried — that is a header/protocol problem a proxy can't fix.
+- Exits are sticky per **viewer + host** (`CF-Connecting-IP` → `X-Forwarded-For`
+  → peer), so one playback session keeps one warm tunnel and one IP while
+  different viewers spread across the pool.
+- A proxy that fails to connect or answers 407 is skipped for 30 seconds and the
+  request retries once on the next exit (GET/HEAD only). A 429 through a proxy
+  also retries once on the next exit.
+
+Once a minute, hosts that returned 403/429/5xx or connection errors are logged
+with counts (`upstream <host>: ...`) — check those before adding a host to the
+forced list. Proxy endpoints must resolve to public IPs; trusted proxies must
+also block private destinations when resolving target hosts remotely.
+
+## Behavior
+
+- Shared HTTP/1 and provider-specific HTTP/2 clients, TLS session reuse.
+- 256 KiB pooled copy buffers, cancellation on disconnect, and streaming backpressure.
+- Playlist rewriting with a 10 MiB input limit and server-side redirects (up to 5).
+- Range and conditional headers preserved; partial responses and errors aren't cached.
+- Upstream `Retry-After` passed through. Cloudflare challenge responses aren't cached.
+- Interrupted streams abort the response so truncated segments cannot look complete.
+- No request queues or local cache. Retries exist only for proxy failover and
+  direct 429s, never after bytes reach the viewer.
+
+## Capacity
+
+RAM settings recalculate at startup, including Linux cgroup limits. Leave the
+capacity overrides unset when moving VPSes. The active-request cap is half of RAM
+divided by ~1.5 MiB per stream (1365 on 4 GiB); there is no per-host connection
+cap by default. At capacity, return uncached 503 with Retry-After: 1.
+
+| Setting | Default |
+|---|---|
+| `PORT` / `BIND_ADDR` | `3847` / all interfaces |
+| `SECRET_KEY` | legacy compatibility key; set to match frontend |
+| `ALLOWED_ORIGINS` | unrestricted; frontend domain allow-list, not authentication |
+| `ALLOW_RAW_URL` | `1`; `0` requires tokens |
+| `STREAM_BUFFER_KB` | `256`, clamped to 32–1024 |
+| `MAX_CONCURRENT` | RAM-derived; explicit `0` means unlimited |
+| `MAX_CONNS_PER_HOST` | unlimited (`0`) |
+| `MAX_IDLE_CONNS` / `MAX_IDLE_CONNS_PER_HOST` | RAM-derived, per transport |
+| `GOMEMLIMIT` | soft Go-runtime target of 70% detected RAM |
+| `INSECURE_TLS` | off; `1` disables upstream certificate verification |
+| `MASK_SEGMENT_TYPE` | `1` (legacy); `0` serves actual media types |
+
+The memory target excludes kernel buffers and other processes. At 1 Gbps, an
+800 Mbps working budget is roughly 200 continuous 4 Mbps streams through the VPS;
+CDN cache hits can serve additional viewers without reaching it.
+
+## CDN and deployment
+
+Keep the existing [Caddy/systemd deployment](deploy/README.md). Cloudflare cache
+rules must make the relevant routes eligible and respect origin Cache-Control:
+segments are immutable; VOD/master playlists use longer freshness; live playlists
+use about 2 seconds. Keep signed tokens/query strings in cache keys and ensure
+playlist freshness does not outlast source URLs. Cache hits bypass the app's origin
+allow-list, so enforce any required access rules at the edge.
+
+The old live sample showed segment HITs but DYNAMIC playlists; check playlist cache
+eligibility before attributing startup latency to Go. No proxy can guarantee zero
+403/429 responses from third-party sources.
 
 ```sh
-./fastproxy encode "https://host/master.m3u8" "https://referer.site"
-# -> paste after /stream/  ->  http://localhost:3847/stream/<token>
+go test -race ./...
+go test -run '^$' -bench Stream -benchmem
 ```
-
-## Env vars
-
-| var | default | meaning |
-|-----|---------|---------|
-| `PORT` | `3847` | listen port |
-| `SECRET_KEY` | `aproxy2026` | payload XOR key (must match frontend) |
-| `UPSTREAM_PROXY` | _(none)_ | egress proxy URL for blocked hosts, e.g. `http://user:pass@host:port` |
-| `UPSTREAM_PROXY_DOMAINS` | _(none)_ | comma list of host suffixes to route via the proxy; empty + proxy set = all |
-| `MAX_CONCURRENT` | `0` | max simultaneous streams (0 = unlimited); excess gets `503` |
-| `INSECURE_TLS` | _(off)_ | `1` to skip upstream cert verification (sketchy CDNs only) |
-| `ALLOW_RAW_URL` | `1` | `0` to disable `?url=` mode and require XOR tokens |
-| `MAX_IDLE_CONNS` | _(auto)_ | total pooled upstream connections; auto-sized from RAM (min 1000) |
-| `MAX_IDLE_CONNS_PER_HOST` | _(auto)_ | pooled connections per CDN host; defaults to a quarter of the total |
-
-## What it does
-
-- Takes the target from `?url=` (raw-URL mode) or decrypts it from the path, forges `Referer`/`Origin`.
-- Rewrites HLS manifests (`.m3u8`) so every segment/key/variant routes back through us — detected by extension, content-type, or `#EXTM3U` sniffing (extension-less hosts).
-- Streams everything else with bounded RAM (backpressured copy).
-- Follows 3xx redirects server-side (up to 5 hops, SSRF-checked per hop) — no extra client round-trip per segment; POST falls back to a re-wrapped client redirect.
-- Forwards conditional headers (`If-None-Match` etc.) so 304 revalidation works end-to-end.
-- Wildcard CORS (no credentials/Vary) + cache headers tuned per kind: segments immutable-forever, master/VOD playlists 5m browser / 4h edge, live playlists ~2s → CDN-friendly without freezing live streams.
-
-## Throughput notes
-
-Two things dominate how much video one box can push, and both are easy to get
-silently wrong:
-
-- **The copy runs through `writerOnly{w}`, not `w` directly.** `io.CopyBuffer`
-  ignores the buffer you give it when the destination implements
-  `io.ReaderFrom` — and `net/http`'s ResponseWriter does. Passing the
-  ResponseWriter bare meant the 1 MB pooled buffer was never touched and every
-  transfer ran at 32 KB. Hiding the shortcut is worth +31% on a 4 MB segment
-  and +52% on a 32 MB file (`go test -bench Stream`), and gives up nothing:
-  sendfile/splice can never fire with an HTTP response body as the source.
-- **The per-host idle-connection cap is the one that bites.** Every viewer pulls
-  from the same handful of CDN hostnames, so one pool entry carries the whole
-  box. Above the cap, Go closes connections instead of parking them and the next
-  segment pays a fresh TCP + TLS handshake. `autoTune()` sizes this at startup.
-
-```sh
-go test -bench . -benchmem     # stream copy + manifest rewrite
-```
-
-## Scaling
-
-Put a CDN in front (the cache headers do the work), raise `ulimit -n`, and only
-add instances behind a load balancer if one box's bandwidth saturates. See the
-project notes for the full reasoning.
