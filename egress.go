@@ -210,7 +210,9 @@ func clientIP(r *http.Request) string {
 // at this point, so a replay can never duplicate bytes.
 func fetchUpstream(client *http.Client, req *http.Request, server, viewer string) (*http.Response, error) {
 	host := strings.ToLower(req.URL.Hostname())
-	if len(egress.proxies) == 0 {
+	// chromeClient cannot tunnel (see chrome.go), so it never enters the pool —
+	// handing it an exit would only be ignored and misreport the request.
+	if len(egress.proxies) == 0 || client == chromeClient {
 		resp, err := client.Do(req)
 		recordUpstream(host, resp, err, false)
 		return resp, err
