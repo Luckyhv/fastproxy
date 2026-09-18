@@ -53,6 +53,15 @@ type upstreamIdentity struct {
 	// refuse HTTP/1.1 outright: owocdn.top answers a 403 block page to an h1
 	// request and 200 to the byte-identical h2 one.
 	http2 bool
+
+	// secFetchSite overrides the baseline's "cross-site". settlar's media host
+	// answers `cross-site-hotlink-denied` to anything but the "same-site" a
+	// browser sends when embed.settlar.io asks media.settlar.io.
+	secFetchSite string
+
+	// chromeTLS routes the provider through chromeClient: its hosts fingerprint
+	// the TLS handshake and refuse Go's. Implies HTTP/2 and direct egress.
+	chromeTLS bool
 }
 
 // servers is the single source of truth, keyed by the public provider key the
@@ -65,6 +74,12 @@ type upstreamIdentity struct {
 //	       TS segments as .xls / application/vnd.ms-excel (see headers.go).
 //	wave → echovideo.to has no referer check. Its quirk is serving the playlist
 //	       as image/jpeg from an extension-less path (see m3u8.go).
+//	pam  → *.settlar.io, ani.pm's player. Cloudflare refuses any non-Chrome TLS
+//	       handshake (chrome.go); media.settlar.io additionally wants the
+//	       embed's own Origin and a same-site fetch. Its tokens are not IP-bound,
+//	       so the API minting the session and us redeeming it is fine.
+//	pamapi → ani.pm's own JSON API, same TLS gate. The API cannot pass it from
+//	       Bun, so it asks through us (see anikage-api's anipm scraper).
 //
 // A provider belongs here ONLY when one fixed identity is right for every source
 // it returns. koto is the counter-example and is deliberately absent: it fans out
@@ -76,10 +91,12 @@ type upstreamIdentity struct {
 //
 // Add a provider here and it is wired end to end; there is nothing else to edit.
 var servers = map[string]upstreamIdentity{
-	"uwu":  {origin: "https://kwik.cx", referer: "https://kwik.cx/", noCache: true, http2: true},
-	"kiwi": {origin: "https://hls.anidb.app", referer: "https://hls.anidb.app/"},
-	"wave": {origin: "https://play.echovideo.ru", referer: "https://play.echovideo.ru/"},
-	"megg": {origin: "https://www.animegg.org", referer: "https://www.animegg.org/"},
+	"uwu":    {origin: "https://kwik.cx", referer: "https://kwik.cx/", noCache: true, http2: true},
+	"kiwi":   {origin: "https://hls.anidb.app", referer: "https://hls.anidb.app/"},
+	"wave":   {origin: "https://play.echovideo.ru", referer: "https://play.echovideo.ru/"},
+	"megg":   {origin: "https://www.animegg.org", referer: "https://www.animegg.org/"},
+	"pam":    {origin: "https://embed.settlar.io", referer: "https://embed.settlar.io/", secFetchSite: "same-site", chromeTLS: true},
+	"pamapi": {origin: "https://ani.pm", referer: "https://ani.pm/", secFetchSite: "same-origin", chromeTLS: true},
 }
 
 // lookupServer resolves the provider identity from the server name the API put
@@ -96,6 +113,12 @@ func lookupServer(server string) (upstreamIdentity, bool) {
 	}
 	id, ok := servers[strings.ToLower(strings.TrimSpace(server))]
 	return id, ok
+}
+
+// chromeServer reports whether this provider must go through chromeClient.
+func chromeServer(server string) bool {
+	id, ok := lookupServer(server)
+	return ok && id.chromeTLS
 }
 
 // applyUpstreamHeaders stamps the browser baseline plus the Origin/Referer this
@@ -123,6 +146,9 @@ func applyUpstreamHeaders(req *http.Request, target *url.URL, tokenReferer, serv
 	if id, ok := lookupServer(server); ok {
 		h.Set("Origin", id.origin)
 		h.Set("Referer", id.referer)
+		if id.secFetchSite != "" {
+			h.Set("Sec-Fetch-Site", id.secFetchSite)
+		}
 		if id.noCache {
 			h.Set("Cache-Control", "no-cache")
 			h.Set("Pragma", "no-cache")

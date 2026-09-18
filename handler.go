@@ -339,6 +339,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if useHTTP2 {
 		client = h2Client
 	}
+	// And a couple more refuse any TLS handshake that is not Chrome's.
+	if chromeServer(server) {
+		client = chromeClient
+	}
 
 	// 4. Fire the upstream fetch. resp.Body is a STREAM, not the full payload —
 	//    nothing has been downloaded into memory yet at this line.
