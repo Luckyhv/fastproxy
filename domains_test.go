@@ -241,3 +241,33 @@ func TestEgressConfig(t *testing.T) {
 		t.Fatal("missing proxy file silently accepted")
 	}
 }
+
+// pam: media.settlar.io answers `cross-site-hotlink-denied` unless the request
+// looks like the embed asking its own sibling host, and every *.settlar.io host
+// refuses a non-Chrome TLS handshake.
+func TestPamGetsEmbedOriginSameSiteAndChromeTLS(t *testing.T) {
+	h, _ := headersFor(t, "https://media.settlar.io/v1/object/v2.abc", "https://ani.pm/", "pam")
+	if got := h.Get("Origin"); got != "https://embed.settlar.io" {
+		t.Fatalf("Origin = %q, want the embed origin", got)
+	}
+	if got := h.Get("Sec-Fetch-Site"); got != "same-site" {
+		t.Fatalf("Sec-Fetch-Site = %q, want same-site", got)
+	}
+	if !chromeServer("pam") || !chromeServer("pamapi") {
+		t.Fatal("settlar and ani.pm must go through the Chrome TLS client")
+	}
+}
+
+// The override is per provider: everyone else keeps the browser baseline, and
+// nobody else is moved onto the Chrome client by accident.
+func TestSecFetchSiteAndChromeTLSStayScoped(t *testing.T) {
+	for _, server := range []string{"uwu", "wave", "koto", ""} {
+		h, _ := headersFor(t, "https://cdn.example.test/a.m3u8", "", server)
+		if got := h.Get("Sec-Fetch-Site"); got != "cross-site" {
+			t.Fatalf("%q: Sec-Fetch-Site = %q, want the cross-site baseline", server, got)
+		}
+		if chromeServer(server) {
+			t.Fatalf("%q must not use the Chrome TLS client", server)
+		}
+	}
+}
