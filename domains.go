@@ -41,7 +41,7 @@ var defaultHeaders = http.Header{
 
 // upstreamIdentity is everything a given provider's CDN demands of us.
 type upstreamIdentity struct {
-	origin  string // Origin header (no trailing slash)
+	origin  string // Origin header (no trailing slash); empty = send none
 	referer string // Referer header (with trailing slash)
 
 	// noCache adds Cache-Control/Pragma: no-cache to the UPSTREAM request. Some
@@ -70,8 +70,15 @@ type upstreamIdentity struct {
 //	uwu  → owocdn.top 403s (Cloudflare block page) for EVERY origin except
 //	       kwik.cx — including its own and the site that served the link — and
 //	       refuses HTTP/1.1 regardless of headers.
-//	kiwi → hls.anidb.app has no referer check. Its quirk is elsewhere: it serves
-//	       TS segments as .xls / application/vnd.ms-excel (see headers.go).
+//	kiwi → animex stopped offering kiwi itself; the API still tags animex
+//	       SUBTITLES "kiwi", and they sit on megaplay-family CDNs (rotating
+//	       *.top hosts) that 403 anything but a megaplay.buzz Referer —
+//	       including the old hls.anidb.app identity, which no current host
+//	       accepts (measured Sept 23 2026).
+//	yuki → animex's dub sub-server: megap.* masters behind the same gate.
+//	       Both send the Referer WITHOUT an Origin: every megaplay host takes
+//	       that, and hls2.aniwatchtv.uk (also in kiwi's subtitle set) 403s any
+//	       request carrying an Origin, whatever its value.
 //	wave → echovideo.to has no referer check. Its quirk is serving the playlist
 //	       as image/jpeg from an extension-less path (see m3u8.go).
 //	pam  → *.settlar.io, ani.pm's player. Cloudflare refuses any non-Chrome TLS
@@ -92,7 +99,8 @@ type upstreamIdentity struct {
 // Add a provider here and it is wired end to end; there is nothing else to edit.
 var servers = map[string]upstreamIdentity{
 	"uwu":    {origin: "https://kwik.cx", referer: "https://kwik.cx/", noCache: true, http2: true},
-	"kiwi":   {origin: "https://hls.anidb.app", referer: "https://hls.anidb.app/"},
+	"kiwi":   {referer: "https://megaplay.buzz/"},
+	"yuki":   {referer: "https://megaplay.buzz/"},
 	"wave":   {origin: "https://play.echovideo.ru", referer: "https://play.echovideo.ru/"},
 	"megg":   {origin: "https://www.animegg.org", referer: "https://www.animegg.org/"},
 	"pam":    {origin: "https://embed.settlar.io", referer: "https://embed.settlar.io/", secFetchSite: "same-site", chromeTLS: true},
@@ -144,7 +152,9 @@ func applyUpstreamHeaders(req *http.Request, target *url.URL, tokenReferer, serv
 	}
 
 	if id, ok := lookupServer(server); ok {
-		h.Set("Origin", id.origin)
+		if id.origin != "" {
+			h.Set("Origin", id.origin)
+		}
 		h.Set("Referer", id.referer)
 		if id.secFetchSite != "" {
 			h.Set("Sec-Fetch-Site", id.secFetchSite)

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,8 +100,26 @@ func describeForbidden(resp *http.Response, proxied bool) string {
 			referer = ref
 		}
 	}
-	return fmt.Sprintf("by=%q type=%q path=%s query=%s referer=%s proxied=%t",
-		by, resp.Header.Get("Content-Type"), path, query, referer, proxied)
+	site := "-"
+	if resp.Request != nil {
+		if v, ok := resp.Request.Context().Value(viewerSiteKey{}).(string); ok && v != "" {
+			site = v
+		}
+	}
+	return fmt.Sprintf("by=%q type=%q path=%s query=%s referer=%s proxied=%t site=%s",
+		by, resp.Header.Get("Content-Type"), path, query, referer, proxied, site)
+}
+
+type viewerSiteKey struct{}
+
+// viewerSite is the host of the page that asked us: Origin, else Referer.
+func viewerSite(r *http.Request) string {
+	for _, v := range []string{r.Header.Get("Origin"), r.Header.Get("Referer")} {
+		if u, err := url.Parse(v); err == nil && u.Host != "" {
+			return u.Host
+		}
+	}
+	return ""
 }
 
 func shortPath(p string) string {

@@ -233,6 +233,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	if r.Context().Err() != nil {
 		return
 	}
+	// Remember which site asked, so a 403 sample can name it (stats.go). Several
+	// sites share these boxes and they build their tokens differently.
+	r = r.WithContext(context.WithValue(r.Context(), viewerSiteKey{}, viewerSite(r)))
 	if inFlight != nil {
 		select {
 		case inFlight <- struct{}{}:

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -70,12 +72,19 @@ func TestServerNameIsCaseAndSpaceInsensitive(t *testing.T) {
 }
 
 func TestKiwiAndWaveIdentities(t *testing.T) {
-	kiwi, kiwiH2 := headersFor(t, "https://hls.anidb.app/stream/abc/master.m3u8", "", "kiwi")
-	if got := kiwi.Get("Referer"); got != "https://hls.anidb.app/" {
-		t.Fatalf("kiwi Referer = %q", got)
-	}
-	if kiwiH2 {
-		t.Fatal("kiwi should stay on HTTP/1.1 — h2 exists only for hosts that refuse h1")
+	// animex's kiwi subtitles and yuki dub masters sit behind megaplay's gate:
+	// measured, only a megaplay.buzz Referer gets past it.
+	for _, server := range []string{"kiwi", "yuki"} {
+		h, h2 := headersFor(t, "https://megap.shiora.top/abc/def/master.m3u8", "", server)
+		if got := h.Get("Referer"); got != "https://megaplay.buzz/" {
+			t.Fatalf("%s Referer = %q, want megaplay.buzz", server, got)
+		}
+		if got := h.Get("Origin"); got != "" {
+			t.Fatalf("%s sent Origin %q; aniwatchtv 403s any Origin", server, got)
+		}
+		if h2 {
+			t.Fatalf("%s should stay on HTTP/1.1 — h2 exists only for hosts that refuse h1", server)
+		}
 	}
 	wave, waveH2 := headersFor(t, "https://ru-cdn1.echovideo.to/cdn/abc?t.m3u8", "", "wave")
 	if got := wave.Get("Referer"); got != "https://play.echovideo.ru/" {
@@ -279,8 +288,11 @@ func TestForbiddenSampleRedactsQuery(t *testing.T) {
 	req.Header.Set("Referer", "https://megaplay.buzz/")
 	resp := &http.Response{StatusCode: 403, Request: req, Header: http.Header{
 		"Server": {"cloudflare"}, "Cf-Mitigated": {"challenge"}, "Content-Type": {"text/html"}}}
+	site := httptest.NewRequest("GET", "http://proxy.test/x", nil)
+	site.Header.Set("Origin", "https://gg.akage.lol")
+	resp.Request = req.WithContext(context.WithValue(req.Context(), viewerSiteKey{}, viewerSite(site)))
 	got := describeForbidden(resp, true)
-	for _, want := range []string{`by="cloudflare cf-mitigated=challenge"`, "query=present", "referer=https://megaplay.buzz/", "proxied=true", "/v1/01234567…/seg-1.ts"} {
+	for _, want := range []string{"site=gg.akage.lol", `by="cloudflare cf-mitigated=challenge"`, "query=present", "referer=https://megaplay.buzz/", "proxied=true", "/v1/01234567…/seg-1.ts"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("sample %q missing %q", got, want)
 		}
