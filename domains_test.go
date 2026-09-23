@@ -271,3 +271,21 @@ func TestSecFetchSiteAndChromeTLSStayScoped(t *testing.T) {
 		}
 	}
 }
+
+// A 403 sample must say who refused and what we sent, and never leak the
+// signed query string.
+func TestForbiddenSampleRedactsQuery(t *testing.T) {
+	req, _ := http.NewRequest("GET", "https://megap.example.top/v1/0123456789abcdef0123456789abcdef/seg-1.ts?token=SECRET", nil)
+	req.Header.Set("Referer", "https://megaplay.buzz/")
+	resp := &http.Response{StatusCode: 403, Request: req, Header: http.Header{
+		"Server": {"cloudflare"}, "Cf-Mitigated": {"challenge"}, "Content-Type": {"text/html"}}}
+	got := describeForbidden(resp, true)
+	for _, want := range []string{`by="cloudflare cf-mitigated=challenge"`, "query=present", "referer=https://megaplay.buzz/", "proxied=true", "/v1/01234567…/seg-1.ts"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("sample %q missing %q", got, want)
+		}
+	}
+	if strings.Contains(got, "SECRET") {
+		t.Fatalf("sample leaked the query: %q", got)
+	}
+}
