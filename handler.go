@@ -498,9 +498,25 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// An upstream that drops mid-segment is healed with a Range request for the
+	// missing tail (resume.go) instead of aborting the viewer's response.
+	body := resp.Body
+	if r.Method == http.MethodGet {
+		body = newResumingBody(resp, int64(len(sniffed)), r.Context(), func(rangeHeader string) (*http.Response, error) {
+			rreq, rerr := http.NewRequestWithContext(r.Context(), http.MethodGet, target.String(), nil)
+			if rerr != nil {
+				return nil, rerr
+			}
+			rreq.Header = req.Header.Clone()
+			rreq.Header.Set("Range", rangeHeader)
+			return fetchUpstream(client, rreq, server, viewer)
+		})
+		defer body.Close() // the resumed body, not the one deferred above
+	}
+
 	buf := bufPool.Get().(*[]byte)
 	defer bufPool.Put(buf)
-	_, err = io.CopyBuffer(writerOnly{w}, resp.Body, *buf)
+	_, err = io.CopyBuffer(writerOnly{w}, body, *buf)
 	if err != nil {
 		if !isClientGone(err) {
 			log.Printf("stream error: %v", err)
