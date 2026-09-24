@@ -47,9 +47,11 @@ func fullResp(cut int, h http.Header) *http.Response {
 func rangeServer(t *testing.T, calls *[]string, mutate func(*http.Response)) func(string) (*http.Response, error) {
 	return func(rng string) (*http.Response, error) {
 		*calls = append(*calls, rng)
-		var a, b int
+		a, b := 0, len(object)-1
 		if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &a, &b); err != nil {
-			t.Fatalf("bad range %q", rng)
+			if _, err := fmt.Sscanf(rng, "bytes=%d-", &a); err != nil {
+				t.Fatalf("bad range %q", rng)
+			}
 		}
 		resp := &http.Response{StatusCode: 206, Header: http.Header{
 			"Content-Range": {fmt.Sprintf("bytes %d-%d/%d", a, b, len(object))},
@@ -109,7 +111,6 @@ func TestResumeRefusesAnotherObject(t *testing.T) {
 		"etag changed":   func(r *http.Response) { r.Header.Set("Etag", `"v2"`) },
 		"size changed":   func(r *http.Response) { r.Header.Set("Content-Range", "bytes 10-35/99") },
 		"wrong offset":   func(r *http.Response) { r.Header.Set("Content-Range", "bytes 0-35/36") },
-		"range ignored":  func(r *http.Response) { r.StatusCode = 200 },
 		"upstream error": func(r *http.Response) { r.StatusCode = 403 },
 	}
 	for name, mutate := range cases {
@@ -142,14 +143,76 @@ func TestResumeIsBounded(t *testing.T) {
 	}
 }
 
-// Without a known span there is nothing safe to ask for, so the body is left as is.
-func TestNoWrapWithoutRangeSupport(t *testing.T) {
+// yuki's tiktokcdn answers 200 with a length but no Accept-Ranges, yet honours
+// Range: a missing header must not stop us from asking.
+func TestResumeWithoutAcceptRangesHeader(t *testing.T) {
+	var calls []string
 	resp := fullResp(10, http.Header{"Accept-Ranges": {"none"}})
-	if body := newResumingBody(resp, 0, context.Background(), nil); body != resp.Body {
-		t.Fatal("wrapped a body the upstream cannot resume")
+	resp.Header.Del("Accept-Ranges")
+	got, err := io.ReadAll(newResumingBody(resp, 0, context.Background(), rangeServer(t, &calls, nil)))
+	if err != nil || string(got) != object {
+		t.Fatalf("got %q, %v", got, err)
 	}
-	resp = &http.Response{StatusCode: 200, ContentLength: -1, Header: http.Header{"Accept-Ranges": {"bytes"}}, Body: http.NoBody}
+}
+
+// wave and koto ignore Range and send the whole object again, chunked, with a
+// strong ETag: prove identity by the tag and skip what the viewer already has.
+func TestResumeReplaysWhenRangeIgnored(t *testing.T) {
+	var calls []string
+	resp := &http.Response{StatusCode: 200, ContentLength: -1, Header: http.Header{"Etag": {`"v1"`}},
+		Body: &cutBody{r: strings.NewReader(object), left: 10}}
+	full := func(r *http.Response) {
+		r.StatusCode, r.ContentLength = 200, -1
+		r.Header.Del("Content-Range")
+		r.Body = io.NopCloser(strings.NewReader(object))
+	}
+	got, err := io.ReadAll(newResumingBody(resp, 0, context.Background(), rangeServer(t, &calls, full)))
+	if err != nil || string(got) != object {
+		t.Fatalf("got %q, %v; want the whole object once", got, err)
+	}
+	if calls[0] != "bytes=10-" {
+		t.Fatalf("asked %v, want an open-ended range", calls)
+	}
+}
+
+// Without a strong ETag a replayed 200 proves nothing (beep's playeng), and a
+// matching length alone is not identity either.
+func TestReplayNeedsStrongETag(t *testing.T) {
+	for name, etag := range map[string]string{"none": "", "weak": `W/"v1"`} {
+		var calls []string
+		h := http.Header{}
+		if etag != "" {
+			h.Set("Etag", etag)
+		}
+		resp := &http.Response{StatusCode: 200, ContentLength: int64(len(object)), Header: h,
+			Body: &cutBody{r: strings.NewReader(object), left: 10}}
+		full := func(r *http.Response) {
+			r.StatusCode, r.ContentLength = 200, int64(len(object))
+			r.Header = h.Clone()
+			r.Body = io.NopCloser(strings.NewReader(object))
+		}
+		got, err := io.ReadAll(newResumingBody(resp, 0, context.Background(), rangeServer(t, &calls, full)))
+		if !errors.Is(err, io.ErrUnexpectedEOF) || string(got) != object[:10] {
+			t.Errorf("%s etag: got %q, %v; want the cut surfaced", name, got, err)
+		}
+	}
+}
+
+// A chunked body that ends cleanly is complete; only a broken read resumes.
+func TestUnknownLengthCleanEOFIsEnd(t *testing.T) {
+	var calls []string
+	resp := &http.Response{StatusCode: 200, ContentLength: -1, Header: http.Header{"Etag": {`"v1"`}},
+		Body: io.NopCloser(strings.NewReader(object))}
+	got, err := io.ReadAll(newResumingBody(resp, 0, context.Background(), rangeServer(t, &calls, nil)))
+	if err != nil || string(got) != object || len(calls) != 0 {
+		t.Fatalf("got %q, %v, %d resumes; want a plain read", got, err, len(calls))
+	}
+}
+
+// Error statuses are passed through untouched.
+func TestNoWrapForErrorStatus(t *testing.T) {
+	resp := &http.Response{StatusCode: 403, Header: http.Header{}, Body: http.NoBody}
 	if body := newResumingBody(resp, 0, context.Background(), nil); body != resp.Body {
-		t.Fatal("wrapped a body of unknown length")
+		t.Fatal("wrapped an error response")
 	}
 }
