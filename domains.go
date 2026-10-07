@@ -16,12 +16,12 @@ import (
 //     produces, and WAFs score it accordingly.
 //
 //  2. The Referer/Origin has to be the host's OWN player page — not our proxy,
-//     not the site that gave us the URL. owocdn.top serves nothing unless the
-//     request claims to come from kwik.cx, a completely unrelated domain.
+//     not the site that gave us the URL. megaplay's CDNs serve nothing unless
+//     the request claims to come from megaplay.buzz, an unrelated domain.
 //
-// The lookup key is the SERVER NAME the API puts in the token ("uwu", "kiwi",
-// "wave"). Not the CDN hostname: hostnames rotate constantly (owocdn.top cycles
-// vault-N subdomains and swaps its apex domain), while the provider does not.
+// The lookup key is the SERVER NAME the API puts in the token ("kiwi", "wave",
+// …). Not the CDN hostname: hostnames rotate constantly while the provider
+// does not.
 
 // defaultHeaders is the browser-shaped baseline every upstream request starts
 // from, pre-canonicalized so stamping it is a plain map copy with no per-request
@@ -44,16 +44,6 @@ type upstreamIdentity struct {
 	origin  string // Origin header (no trailing slash); empty = send none
 	referer string // Referer header (with trailing slash)
 
-	// noCache adds Cache-Control/Pragma: no-cache to the UPSTREAM request. Some
-	// WAF configs treat a cache-revalidating fetch as more browser-like.
-	noCache bool
-
-	// http2 forces this provider onto the HTTP/2 client. We default to HTTP/1.1
-	// everywhere for throughput (see transport.go), but some Cloudflare configs
-	// refuse HTTP/1.1 outright: owocdn.top answers a 403 block page to an h1
-	// request and 200 to the byte-identical h2 one.
-	http2 bool
-
 	// secFetchSite overrides the baseline's "cross-site". settlar's media host
 	// answers `cross-site-hotlink-denied` to anything but the "same-site" a
 	// browser sends when embed.settlar.io asks media.settlar.io.
@@ -62,14 +52,45 @@ type upstreamIdentity struct {
 	// chromeTLS routes the provider through chromeClient: its hosts fingerprint
 	// the TLS handshake and refuse Go's. Implies HTTP/2 and direct egress.
 	chromeTLS bool
+
+	// sessionCookie names the cookie that carries a per-session value from the
+	// token (see splitServer). Empty = the provider needs none. Only the VALUE
+	// travels in the token; the name is fixed here, so a token can never make
+	// us send an arbitrary header.
+	sessionCookie string
+}
+
+// splitServer separates the token's server field into the provider name and an
+// optional per-session value: "kite~<value>". Everything that keys on the
+// provider (identity, egress rules, the nero mint) uses the name alone; the
+// whole field is what gets re-signed into child URLs, so a playlist's segments
+// keep the session they were minted for.
+func splitServer(server string) (name, session string) {
+	if i := strings.IndexByte(server, '~'); i >= 0 {
+		return server[:i], server[i+1:]
+	}
+	return server, ""
+}
+
+// validSession keeps the session value to cookie-safe characters.
+func validSession(v string) bool {
+	if v == "" || len(v) > 256 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '.', c == '_', c == '-':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // servers is the single source of truth, keyed by the public provider key the
 // API sends. Verified live against each provider's current CDN:
 //
-//	uwu  → owocdn.top 403s (Cloudflare block page) for EVERY origin except
-//	       kwik.cx — including its own and the site that served the link — and
-//	       refuses HTTP/1.1 regardless of headers.
 //	kiwi → animex stopped offering kiwi itself; the API still tags animex
 //	       SUBTITLES "kiwi", and they sit on megaplay-family CDNs (rotating
 //	       *.top hosts) that 403 anything but a megaplay.buzz Referer —
@@ -87,6 +108,13 @@ type upstreamIdentity struct {
 //	       so the API minting the session and us redeeming it is fine.
 //	pamapi → ani.pm's own JSON API, same TLS gate. The API cannot pass it from
 //	       Bun, so it asks through us (see anikage-api's anipm scraper).
+//	kite → anv.to serves playlists, segments and subtitles itself, from
+//	       /stream/<token>. Each one 403s without the `shiro_watch` cookie of
+//	       the session that asked for the episode, so the API puts that
+//	       session's value after the name ("kite~<value>"). Not IP-bound
+//	       (minted on v4, fetched on v6, Oct 2026). Segments are MPEG-TS behind
+//	       a 70-byte PNG header, served as image/png; hls.js finds the sync
+//	       byte and plays them.
 //
 // A provider belongs here ONLY when one fixed identity is right for every source
 // it returns. koto is the counter-example and is deliberately absent: it fans out
@@ -98,13 +126,13 @@ type upstreamIdentity struct {
 //
 // Add a provider here and it is wired end to end; there is nothing else to edit.
 var servers = map[string]upstreamIdentity{
-	"uwu":    {origin: "https://kwik.cx", referer: "https://kwik.cx/", noCache: true, http2: true},
 	"kiwi":   {referer: "https://megaplay.buzz/"},
 	"yuki":   {referer: "https://megaplay.buzz/"},
 	"wave":   {origin: "https://play.echovideo.ru", referer: "https://play.echovideo.ru/"},
 	"megg":   {origin: "https://www.animegg.org", referer: "https://www.animegg.org/"},
 	"pam":    {origin: "https://embed.settlar.io", referer: "https://embed.settlar.io/", secFetchSite: "same-site", chromeTLS: true},
 	"pamapi": {origin: "https://ani.pm", referer: "https://ani.pm/", secFetchSite: "same-origin", chromeTLS: true},
+	"kite":   {origin: "https://anv.to", referer: "https://anv.to/", secFetchSite: "same-origin", sessionCookie: "shiro_watch"},
 }
 
 // lookupServer resolves the provider identity from the server name the API put
@@ -116,6 +144,7 @@ var servers = map[string]upstreamIdentity{
 // An unknown or absent name is not an error: the caller falls back to the token
 // referer, which is the correct identity for every provider not listed above.
 func lookupServer(server string) (upstreamIdentity, bool) {
+	server, _ = splitServer(server)
 	if server == "" {
 		return upstreamIdentity{}, false
 	}
@@ -130,7 +159,7 @@ func chromeServer(server string) bool {
 }
 
 // applyUpstreamHeaders stamps the browser baseline plus the Origin/Referer this
-// upstream demands, and reports whether it must be spoken to over HTTP/2.
+// upstream demands.
 //
 // Precedence for Origin/Referer:
 //  1. the provider identity the server name selects
@@ -138,9 +167,9 @@ func chromeServer(server string) bool {
 //  3. the target's own origin — the safe "same-site" shape
 //
 // 1 beats 2 on purpose: a provider is only listed because the scraper-supplied
-// value is absent or actively wrong for it (animex reports its own domain for
-// uwu links, which is exactly what gets a 403).
-func applyUpstreamHeaders(req *http.Request, target *url.URL, tokenReferer, server string) (useHTTP2 bool) {
+// value is absent or actively wrong for it (animex reports its own domain,
+// which is exactly what gets a 403).
+func applyUpstreamHeaders(req *http.Request, target *url.URL, tokenReferer, server string) {
 	h := req.Header
 	for k, v := range defaultHeaders {
 		// Keys are already canonical, so this skips Set's canonicalization — the
@@ -159,11 +188,12 @@ func applyUpstreamHeaders(req *http.Request, target *url.URL, tokenReferer, serv
 		if id.secFetchSite != "" {
 			h.Set("Sec-Fetch-Site", id.secFetchSite)
 		}
-		if id.noCache {
-			h.Set("Cache-Control", "no-cache")
-			h.Set("Pragma", "no-cache")
+		if id.sessionCookie != "" {
+			if _, session := splitServer(server); validSession(session) {
+				h.Set("Cookie", id.sessionCookie+"="+session)
+			}
 		}
-		return id.http2
+		return
 	}
 
 	if tokenReferer != "" {
@@ -171,11 +201,10 @@ func applyUpstreamHeaders(req *http.Request, target *url.URL, tokenReferer, serv
 		if ref, err := url.Parse(tokenReferer); err == nil && ref.Host != "" {
 			h.Set("Origin", ref.Scheme+"://"+ref.Host)
 		}
-		return false
+		return
 	}
 
 	origin := target.Scheme + "://" + target.Host
 	h.Set("Origin", origin)
 	h.Set("Referer", origin+"/")
-	return false
 }

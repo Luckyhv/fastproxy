@@ -198,9 +198,12 @@ func responseContentType(host, path string, h http.Header) string {
 // per layer, that is the moment to bring them back, not before.
 const (
 	immutableForever = "public, max-age=31536000, s-maxage=31536000, immutable"
-	manifestPolicy   = "public, max-age=300, s-maxage=14400" // browser 5m, edge 4h
-	livePolicy       = "public, max-age=1, s-maxage=2"       // sliding live playlists
-	noStore          = "no-store"
+	// Edge 10 min, not hours: master/VOD playlists embed upstream URLs, and some
+	// sources sign them with expiries shorter than 4h (the old value). Only bites
+	// once Cloudflare actually caches /m3u8/* (it was DYNAMIC until Oct 2026).
+	manifestPolicy = "public, max-age=300, s-maxage=600" // browser 5m, edge 10m
+	livePolicy     = "public, max-age=1, s-maxage=2"     // sliding live playlists
+	noStore        = "no-store"
 )
 
 func setCC(h http.Header, policy string) {

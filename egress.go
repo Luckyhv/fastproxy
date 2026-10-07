@@ -13,7 +13,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -25,10 +24,14 @@ import (
 //
 //   - UPSTREAM_PROXY_SERVERS / UPSTREAM_PROXY_DOMAINS always use the pool
 //     (UPSTREAM_PROXY_SERVERS=* proxies everything).
-//   - Every other host goes DIRECT first. A 429 on a direct fetch replays that
-//     request through the pool and keeps the host there for hotHostTTL, so
-//     unthrottled hosts keep direct speed and throttled ones recover by themselves.
-//     With no filters at all, this is how every host is handled.
+//   - Every other host goes DIRECT. A 429 on a direct fetch replays only that
+//     request through the pool; the next request tries direct again. With no
+//     filters at all, this is how every host is handled.
+//
+// There used to be a "hot host" rule that kept a host on the pool for 10 minutes
+// after one 429. Measured Oct 2026 it put 50–90% of wave's segment traffic on the
+// pool (where a segment crawled at ~6 KB/s) on the strength of 30–90 429s in six
+// hours. Paying one direct round trip per throttled request is far cheaper.
 //
 // Exits are STICKY per viewer+host. Go's transport pools idle connections per
 // proxy URL, so a new exit per request pays a fresh CONNECT + TLS handshake on
@@ -38,7 +41,6 @@ import (
 // provider through a single exit — the exact aggregation the pool exists to undo.
 
 const (
-	hotHostTTL    = 10 * time.Minute // how long a host that 429'd direct stays on the pool
 	proxyCooldown = 30 * time.Second // how long a failing exit is skipped
 )
 
@@ -46,7 +48,6 @@ type egressConfig struct {
 	proxies          []*url.URL
 	servers, domains []string
 	down             []atomic.Int64 // per exit: unix nanos until which it is skipped
-	hot              sync.Map       // host → unix nanos until which it is proxied
 }
 
 type egressKey struct{}
@@ -133,25 +134,6 @@ func (c *egressConfig) forced(host, server string) bool {
 	return false
 }
 
-func (c *egressConfig) isHot(host string) bool {
-	v, ok := c.hot.Load(host)
-	if !ok {
-		return false
-	}
-	if time.Now().UnixNano() < v.(int64) {
-		return true
-	}
-	c.hot.CompareAndDelete(host, v)
-	return false
-}
-
-// markHot returns true when the host was not already on the pool (log once).
-func (c *egressConfig) markHot(host string) bool {
-	now := time.Now().UnixNano()
-	prev, loaded := c.hot.Swap(host, now+int64(hotHostTTL))
-	return !loaded || prev.(int64) <= now
-}
-
 // pick returns the index of the exit for key. attempt 0 is the sticky choice;
 // attempt n walks to the nth healthy exit after it. Exits cooling down are
 // skipped, so a dead proxy's viewers move to a neighbour and come back later.
@@ -218,18 +200,16 @@ func fetchUpstream(client *http.Client, req *http.Request, server, viewer string
 		return resp, err
 	}
 	replayable := req.Body == nil || req.Body == http.NoBody
+	server, _ = splitServer(server) // egress rules key on the provider name
 	server = strings.ToLower(strings.TrimSpace(server))
 
-	if !egress.forced(host, server) && !egress.isHot(host) {
+	if !egress.forced(host, server) {
 		resp, err := client.Do(req)
 		recordUpstream(host, resp, err, false)
 		if err != nil || resp.StatusCode != http.StatusTooManyRequests || !replayable {
 			return resp, err
 		}
 		resp.Body.Close()
-		if egress.markHot(host) {
-			log.Printf("egress: %s answered 429 direct; proxying it for %s", host, hotHostTTL)
-		}
 	}
 
 	attempts := 1

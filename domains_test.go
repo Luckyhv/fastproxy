@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-func headersFor(t *testing.T, rawURL, tokenReferer, server string) (http.Header, bool) {
+func headersFor(t *testing.T, rawURL, tokenReferer, server string) http.Header {
 	t.Helper()
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -21,53 +21,41 @@ func headersFor(t *testing.T, rawURL, tokenReferer, server string) (http.Header,
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	h2 := applyUpstreamHeaders(req, u, tokenReferer, server)
-	return req.Header, h2
-}
-
-// uwu: owocdn.top answers 403 (Cloudflare) for every origin except kwik.cx, and
-// refuses HTTP/1.1 on top of that. Both have to come from one lookup.
-func TestUwuGetsKwikOriginAndHTTP2(t *testing.T) {
-	h, useHTTP2 := headersFor(t, "https://vault-12.owocdn.top/stream/12/13/abc/uwu.m3u8", "", "uwu")
-	if got := h.Get("Referer"); got != "https://kwik.cx/" {
-		t.Fatalf("Referer = %q, want https://kwik.cx/", got)
-	}
-	if got := h.Get("Origin"); got != "https://kwik.cx" {
-		t.Fatalf("Origin = %q, want https://kwik.cx", got)
-	}
-	if !useHTTP2 {
-		t.Fatal("uwu must be routed over HTTP/2")
-	}
-	if h.Get("Cache-Control") != "no-cache" || h.Get("Pragma") != "no-cache" {
-		t.Fatal("uwu should send the no-cache pair upstream")
-	}
+	applyUpstreamHeaders(req, u, tokenReferer, server)
+	return req.Header
 }
 
 // The provider table must beat a scraper-supplied referer, not lose to it:
-// animex reports its own domain for uwu links, and that value is what 403s.
+// animex reports its own domain, and that value is what 403s.
 func TestServerBeatsTokenReferer(t *testing.T) {
-	h, _ := headersFor(t, "https://vault-12.owocdn.top/x/uwu.m3u8", "https://animex.one/", "uwu")
-	if got := h.Get("Referer"); got != "https://kwik.cx/" {
+	h := headersFor(t, "https://ru-cdn1.echovideo.to/x.m3u8", "https://animex.one/", "wave")
+	if got := h.Get("Referer"); got != "https://play.echovideo.ru/" {
 		t.Fatalf("Referer = %q, want the provider table to win", got)
 	}
 }
 
 // The whole point of keying on the server name: it works for a CDN hostname the
-// code has never seen, which is what happens when owocdn rotates domains.
+// code has never seen, which is what happens when a provider rotates domains.
 func TestServerNameWorksForUnknownHost(t *testing.T) {
-	h, useHTTP2 := headersFor(t, "https://vault-99.brand-new-cdn.example/x.m3u8", "https://animex.one/", "uwu")
-	if got := h.Get("Origin"); got != "https://kwik.cx" {
-		t.Fatalf("Origin = %q, want the uwu entry to win", got)
-	}
-	if !useHTTP2 {
-		t.Fatal("http2 flag must follow the server name, not the hostname")
+	h := headersFor(t, "https://vault-99.brand-new-cdn.example/x.m3u8", "https://animex.one/", "wave")
+	if got := h.Get("Origin"); got != "https://play.echovideo.ru" {
+		t.Fatalf("Origin = %q, want the wave entry to win", got)
 	}
 }
 
 func TestServerNameIsCaseAndSpaceInsensitive(t *testing.T) {
-	h, _ := headersFor(t, "https://cdn.example.test/a.m3u8", "", "  UWU ")
-	if got := h.Get("Origin"); got != "https://kwik.cx" {
+	h := headersFor(t, "https://cdn.example.test/a.m3u8", "", "  WAVE ")
+	if got := h.Get("Origin"); got != "https://play.echovideo.ru" {
 		t.Fatalf("Origin = %q", got)
+	}
+}
+
+// uwu is retired (its CDN no longer resolves): the name is now just unknown and
+// must fall through to the token referer like any other.
+func TestRetiredUwuFallsThrough(t *testing.T) {
+	h := headersFor(t, "https://cdn.example.test/a.m3u8", "https://player.example/", "uwu")
+	if got := h.Get("Referer"); got != "https://player.example/" {
+		t.Fatalf("Referer = %q, want the token referer", got)
 	}
 }
 
@@ -75,45 +63,36 @@ func TestKiwiAndWaveIdentities(t *testing.T) {
 	// animex's kiwi subtitles and yuki dub masters sit behind megaplay's gate:
 	// measured, only a megaplay.buzz Referer gets past it.
 	for _, server := range []string{"kiwi", "yuki"} {
-		h, h2 := headersFor(t, "https://megap.shiora.top/abc/def/master.m3u8", "", server)
+		h := headersFor(t, "https://megap.shiora.top/abc/def/master.m3u8", "", server)
 		if got := h.Get("Referer"); got != "https://megaplay.buzz/" {
 			t.Fatalf("%s Referer = %q, want megaplay.buzz", server, got)
 		}
 		if got := h.Get("Origin"); got != "" {
 			t.Fatalf("%s sent Origin %q; aniwatchtv 403s any Origin", server, got)
 		}
-		if h2 {
-			t.Fatalf("%s should stay on HTTP/1.1 — h2 exists only for hosts that refuse h1", server)
-		}
 	}
-	wave, waveH2 := headersFor(t, "https://ru-cdn1.echovideo.to/cdn/abc?t.m3u8", "", "wave")
+	wave := headersFor(t, "https://ru-cdn1.echovideo.to/cdn/abc?t.m3u8", "", "wave")
 	if got := wave.Get("Referer"); got != "https://play.echovideo.ru/" {
 		t.Fatalf("wave Referer = %q", got)
-	}
-	if waveH2 {
-		t.Fatal("wave should stay on HTTP/1.1")
 	}
 }
 
 // The server name is the ONLY key. A request without one falls straight through
 // to the token referer — no hostname guessing, even for a CDN we know by sight.
 func TestNoServerNameFallsThroughToTokenReferer(t *testing.T) {
-	h, useHTTP2 := headersFor(t, "https://vault-12.owocdn.top/x/uwu.m3u8", "https://animex.example/", "")
+	h := headersFor(t, "https://vault-12.owocdn.top/x/uwu.m3u8", "https://animex.example/", "")
 	if got := h.Get("Referer"); got != "https://animex.example/" {
 		t.Fatalf("Referer = %q, want the token referer", got)
 	}
 	if got := h.Get("Origin"); got != "https://animex.example" {
 		t.Fatalf("Origin = %q, want it derived from the token referer", got)
 	}
-	if useHTTP2 {
-		t.Fatal("HTTP/2 is a per-provider opt-in; without a server name we stay on h1")
-	}
 }
 
 // A name we don't have an entry for behaves the same way — it must not blank out
 // the identity, because no referer at all is itself a 403 on most CDNs.
 func TestUnknownServerNameKeepsTokenReferer(t *testing.T) {
-	h, _ := headersFor(t, "https://cdn.example/x.m3u8", "https://player.example/", "not-a-real-server")
+	h := headersFor(t, "https://cdn.example/x.m3u8", "https://player.example/", "not-a-real-server")
 	if got := h.Get("Referer"); got != "https://player.example/" {
 		t.Fatalf("Referer = %q, want the token referer", got)
 	}
@@ -122,7 +101,7 @@ func TestUnknownServerNameKeepsTokenReferer(t *testing.T) {
 // With no server name and no token referer, the target's own origin is the last
 // resort — the safe "same-site" shape.
 func TestNoServerAndNoRefererUsesTargetOrigin(t *testing.T) {
-	h, _ := headersFor(t, "https://cdn.example/x.m3u8", "", "")
+	h := headersFor(t, "https://cdn.example/x.m3u8", "", "")
 	if got := h.Get("Origin"); got != "https://cdn.example" {
 		t.Fatalf("Origin = %q, want the target's own origin", got)
 	}
@@ -142,7 +121,7 @@ func TestKotoKeepsItsPerSourceTokenReferer(t *testing.T) {
 		{"https://megap.mikora.top/abc/def/master.m3u8", "https://megaplay.buzz/"},
 		{"https://vidtub.shiora.site/abc/master.m3u8", "https://vidtube.site/"},
 	} {
-		h, useHTTP2 := headersFor(t, tc.url, tc.tokenReferer, "koto")
+		h := headersFor(t, tc.url, tc.tokenReferer, "koto")
 		if got := h.Get("Referer"); got != tc.tokenReferer {
 			t.Fatalf("%s -> Referer %q, want the token referer %q", tc.url, got, tc.tokenReferer)
 		}
@@ -150,15 +129,12 @@ func TestKotoKeepsItsPerSourceTokenReferer(t *testing.T) {
 		if got := h.Get("Origin"); got != wantOrigin {
 			t.Fatalf("%s -> Origin %q, want %q", tc.url, got, wantOrigin)
 		}
-		if useHTTP2 {
-			t.Fatalf("%s should stay on HTTP/1.1", tc.url)
-		}
 	}
 }
 
 // No table entry: fall back to the token referer, then the target's own origin.
 func TestUnknownHostFallbacks(t *testing.T) {
-	withToken, _ := headersFor(t, "https://cdn.example.test/a.m3u8", "https://player.example.test/", "")
+	withToken := headersFor(t, "https://cdn.example.test/a.m3u8", "https://player.example.test/", "")
 	if got := withToken.Get("Referer"); got != "https://player.example.test/" {
 		t.Fatalf("Referer = %q, want the token referer", got)
 	}
@@ -166,7 +142,7 @@ func TestUnknownHostFallbacks(t *testing.T) {
 		t.Fatalf("Origin = %q", got)
 	}
 
-	bare, _ := headersFor(t, "https://cdn.example.test/a.m3u8", "", "")
+	bare := headersFor(t, "https://cdn.example.test/a.m3u8", "", "")
 	if got := bare.Get("Referer"); got != "https://cdn.example.test/" {
 		t.Fatalf("Referer = %q, want the target's own origin", got)
 	}
@@ -175,7 +151,7 @@ func TestUnknownHostFallbacks(t *testing.T) {
 // A bare "Mozilla/5.0" with no Accept/Sec-Fetch is a fingerprint no browser
 // emits; every request must carry the full baseline.
 func TestBrowserBaselineIsStamped(t *testing.T) {
-	h, _ := headersFor(t, "https://cdn.example.test/a.m3u8", "", "")
+	h := headersFor(t, "https://cdn.example.test/a.m3u8", "", "")
 	for _, k := range []string{"Accept", "Accept-Language", "Sec-Fetch-Dest", "Sec-Fetch-Mode", "Sec-Ch-Ua"} {
 		if h.Get(k) == "" {
 			t.Fatalf("missing %s", k)
@@ -190,11 +166,11 @@ func TestBrowserBaselineIsStamped(t *testing.T) {
 // safe if no request can mutate them, so prove one request can't leak into the
 // next.
 func TestBaselineIsNotMutatedAcrossRequests(t *testing.T) {
-	first, _ := headersFor(t, "https://a.example.test/x.m3u8", "", "uwu")
+	first := headersFor(t, "https://a.example.test/x.m3u8", "", "uwu")
 	first.Set("User-Agent", "tampered")
 	first.Add("Accept", "text/html")
 
-	second, _ := headersFor(t, "https://b.example.test/x.m3u8", "", "")
+	second := headersFor(t, "https://b.example.test/x.m3u8", "", "")
 	if got := second.Get("User-Agent"); got == "tampered" {
 		t.Fatal("User-Agent leaked between requests")
 	}
@@ -255,7 +231,7 @@ func TestEgressConfig(t *testing.T) {
 // looks like the embed asking its own sibling host, and every *.settlar.io host
 // refuses a non-Chrome TLS handshake.
 func TestPamGetsEmbedOriginSameSiteAndChromeTLS(t *testing.T) {
-	h, _ := headersFor(t, "https://media.settlar.io/v1/object/v2.abc", "https://ani.pm/", "pam")
+	h := headersFor(t, "https://media.settlar.io/v1/object/v2.abc", "https://ani.pm/", "pam")
 	if got := h.Get("Origin"); got != "https://embed.settlar.io" {
 		t.Fatalf("Origin = %q, want the embed origin", got)
 	}
@@ -271,7 +247,7 @@ func TestPamGetsEmbedOriginSameSiteAndChromeTLS(t *testing.T) {
 // nobody else is moved onto the Chrome client by accident.
 func TestSecFetchSiteAndChromeTLSStayScoped(t *testing.T) {
 	for _, server := range []string{"uwu", "wave", "koto", ""} {
-		h, _ := headersFor(t, "https://cdn.example.test/a.m3u8", "", server)
+		h := headersFor(t, "https://cdn.example.test/a.m3u8", "", server)
 		if got := h.Get("Sec-Fetch-Site"); got != "cross-site" {
 			t.Fatalf("%q: Sec-Fetch-Site = %q, want the cross-site baseline", server, got)
 		}
@@ -299,5 +275,44 @@ func TestForbiddenSampleRedactsQuery(t *testing.T) {
 	}
 	if strings.Contains(got, "SECRET") {
 		t.Fatalf("sample leaked the query: %q", got)
+	}
+}
+
+func TestSessionCookieTravelsWithTheServerName(t *testing.T) {
+	target, _ := url.Parse("https://anv.to/stream/abc/index.m3u8?k=1")
+	headers := func(server string) http.Header {
+		req, _ := http.NewRequest(http.MethodGet, target.String(), nil)
+		applyUpstreamHeaders(req, target, "https://ignored.example/", server)
+		return req.Header
+	}
+
+	h := headers("kite~Ok39ck5h.1791919801.C-Qrsz_x")
+	if got := h.Get("Cookie"); got != "shiro_watch=Ok39ck5h.1791919801.C-Qrsz_x" {
+		t.Fatalf("Cookie = %q", got)
+	}
+	if h.Get("Origin") != "https://anv.to" || h.Get("Referer") != "https://anv.to/" || h.Get("Sec-Fetch-Site") != "same-origin" {
+		t.Fatalf("identity not applied: %v", h)
+	}
+
+	// No session, or one with characters a cookie value cannot hold: the
+	// identity still applies, no Cookie is sent.
+	for _, server := range []string{"kite", "kite~", "kite~a b", "kite~x; other=1", "kite~x\r\nHost: evil"} {
+		if got := headers(server).Get("Cookie"); got != "" {
+			t.Fatalf("server %q sent Cookie %q", server, got)
+		}
+	}
+	// A provider with no session cookie configured never sends one.
+	if got := headers("megg~abc").Get("Cookie"); got != "" {
+		t.Fatalf("megg sent Cookie %q", got)
+	}
+
+	// Child URLs are re-signed with the whole field, so segments keep the session.
+	token := EncodePayload(target.String(), "", "kite~abc.123")
+	_, _, server, ok := DecodePayload(token)
+	if !ok || server != "kite~abc.123" {
+		t.Fatalf("round trip = %q, %v", server, ok)
+	}
+	if name, session := splitServer(server); name != "kite" || session != "abc.123" {
+		t.Fatalf("split = %q, %q", name, session)
 	}
 }

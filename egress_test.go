@@ -84,7 +84,8 @@ func TestFailedExitRetriesOnNext(t *testing.T) {
 	}
 }
 
-// Unlisted hosts go direct; a 429 moves the host onto the pool.
+// Unlisted hosts go direct; a 429 replays only that request through the pool,
+// and the next request tries direct again.
 func TestDirectFirstFallsBackOn429(t *testing.T) {
 	withEgress(t, newEgress(testExits(2), []string{"uwu"}, nil))
 	var direct, proxied atomic.Int32
@@ -104,8 +105,8 @@ func TestDirectFirstFallsBackOn429(t *testing.T) {
 		}
 		resp.Body.Close()
 	}
-	if direct.Load() != 1 || proxied.Load() != 3 {
-		t.Fatalf("direct=%d proxied=%d, want 1 and 3", direct.Load(), proxied.Load())
+	if direct.Load() != 3 || proxied.Load() != 3 {
+		t.Fatalf("direct=%d proxied=%d, want 3 and 3", direct.Load(), proxied.Load())
 	}
 
 	// A non-429 failure is a header/protocol problem a proxy can't fix.
