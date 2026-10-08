@@ -62,10 +62,10 @@ var headersToForward = []string{
 	"Etag",
 }
 
-// allowRawURL enables plain-URL mode (/stream?url=...). On by default so any
-// HLS stream can be proxied without pre-encoding a token; set ALLOW_RAW_URL=0
-// to require tokens (i.e. knowledge of SECRET_KEY) instead.
-var allowRawURL = getenv("ALLOW_RAW_URL", "1") != "0"
+// allowRawURL enables plain-URL mode (/stream?url=...). OFF by default: it
+// proxies any URL with no token, which makes the signed tokens pointless and
+// turns the box into an open proxy. ALLOW_RAW_URL=1 only for local debugging.
+var allowRawURL = getenv("ALLOW_RAW_URL", "0") == "1"
 
 // readerCloser lets us swap a response body's Reader (e.g. after sniffing a few
 // bytes) while still closing the ORIGINAL body to release the connection.
@@ -79,30 +79,18 @@ type readerCloser struct {
 // does not disable a usable sendfile/splice path.
 type writerOnly struct{ io.Writer }
 
-// knownRoutes are the path prefixes the player will hit. The encrypted token is
-// the segment right after the prefix. We keep a small set so a bare /<token>
-// also works.
-var knownRoutes = map[string]bool{"stream": true, "m3u8": true, "hls": true}
-
-// extractPayload pulls the encrypted token out of the request path. It handles
-//
-//	/stream/<token>          -> <token>
-//	/stream/<token>/seg.jpg  -> <token>   (suffixes added in the m3u8 part)
-//	/<token>                 -> <token>
+// extractPayload accepts /<token> and /{stream,m3u8,hls}/<token>/<suffix>.
+// Cut returns string slices without allocating temporary split arrays.
 func extractPayload(path string) string {
 	path = strings.Trim(path, "/")
-	if path == "" {
-		return ""
+	first, rest, _ := strings.Cut(path, "/")
+	switch first {
+	case "stream", "m3u8", "hls":
+		token, _, _ := strings.Cut(rest, "/")
+		return token
+	default:
+		return first
 	}
-	parts := strings.SplitN(path, "/", 2)
-	if knownRoutes[parts[0]] {
-		if len(parts) < 2 {
-			return ""
-		}
-		// Drop any trailing /suffix the player appended.
-		return strings.SplitN(parts[1], "/", 2)[0]
-	}
-	return strings.SplitN(parts[0], "/", 2)[0]
 }
 
 // maxManifestSize caps how much of a "playlist" we'll buffer. A real .m3u8 is a
@@ -249,9 +237,8 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 
 	// 1. Resolve the target. Two ways in:
 	//    a) plain-URL mode: /stream?url=<absolute-url>&ref=<referer> — the easy
-	//       way to proxy any HLS stream. Disable with ALLOW_RAW_URL=0 if you only
-	//       want tokenized (key-tied) access.
-	//    b) token mode: /stream/<encrypted-payload> (what the frontend generates).
+	//       way to proxy any HLS stream. Off unless ALLOW_RAW_URL=1 (debug only).
+	//    b) token mode: /stream/<signed-payload> (what the API generates).
 	//    Token links carry no query string at all, which is the overwhelming
 	//    majority of our traffic (one request per segment). Gating on RawQuery
 	//    keeps url.Query()'s parse + map allocation off that path entirely.
@@ -263,7 +250,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 			referer = q.Get("referer")
 		}
 		// Raw-URL mode gets the same provider steering as a token: ?server=uwu.
-		server = q.Get("server")
+		// Name only: a session value is accepted from a signed token, never from
+		// a caller-supplied query string.
+		server, _ = splitServer(q.Get("server"))
 	} else {
 		token := extractPayload(r.URL.Path)
 		if token == "" {
@@ -287,6 +276,11 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// metadata (169.254.169.254). External video CDNs are always public IPs.
 	if !isPublicHost(target.Hostname()) {
 		http.Error(w, "forbidden target", http.StatusForbidden)
+		return
+	}
+	// nero: mint the IP-locked playlist here and send segments direct (nero.go).
+	if isNeroMint(target, server) {
+		serveNero(w, r, target)
 		return
 	}
 
@@ -333,16 +327,12 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	// live in domains.go, keyed by the provider name the token carries — the CDN
 	// hostnames rotate, the provider doesn't. Falls back to the token referer,
 	// then to the target's own origin.
-	useHTTP2 := applyUpstreamHeaders(req, target, referer, server)
+	applyUpstreamHeaders(req, target, referer, server)
 	req.Header.Set("Accept-Encoding", "identity")
 
-	// A couple of providers sit behind a Cloudflare config that 403s HTTP/1.1
-	// outright, so they get the h2 client; everyone else keeps h1 for throughput.
+	// One shared HTTP/1.1 client; a couple of providers refuse any TLS
+	// handshake that is not Chrome's and get the Chrome client instead.
 	client := httpClient
-	if useHTTP2 {
-		client = h2Client
-	}
-	// And a couple more refuse any TLS handshake that is not Chrome's.
 	if chromeServer(server) {
 		client = chromeClient
 	}
@@ -521,7 +511,9 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 	defer bufPool.Put(buf)
 	_, err = io.CopyBuffer(writerOnly{w}, body, *buf)
 	if err != nil {
-		if !isClientGone(err) {
+		// Cancellation can close the upstream socket before Read reports it as
+		// context.Canceled. Check the request too so cleanup isn't logged as failure.
+		if r.Context().Err() == nil && !isClientGone(err) {
 			log.Printf("stream error: %v", err)
 		}
 		// Abort even for a reset: it may have come from the upstream, not the

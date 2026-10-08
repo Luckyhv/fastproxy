@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Child URLs emitted by a rewritten manifest must carry the SAME provider key,
@@ -49,23 +54,20 @@ func TestManifestChildrenInheritServer(t *testing.T) {
 	}
 }
 
-// The segment request built from that child token must come out as the uwu
-// identity on the h2 path — the whole point of the port.
-func TestSegmentRequestGetsUwuIdentity(t *testing.T) {
-	target, _ := url.Parse("https://vault-9.owocdn.top/hls/seg1.ts")
+// The segment request built from a child token must come out with the
+// provider's identity, and keep the viewer's Range.
+func TestSegmentRequestGetsProviderIdentity(t *testing.T) {
+	target, _ := url.Parse("https://ru-cdn1.echovideo.to/hls/seg1.ts")
 	req, _ := http.NewRequest("GET", target.String(), nil)
 	req.Header.Set("Range", "bytes=0-1023")
 
-	useHTTP2 := applyUpstreamHeaders(req, target, "https://animex.example/", "uwu")
+	applyUpstreamHeaders(req, target, "https://animex.example/", "wave")
 
-	if !useHTTP2 {
-		t.Error("uwu must route over HTTP/2")
+	if got := req.Header.Get("Referer"); got != "https://play.echovideo.ru/" {
+		t.Errorf("Referer = %q, want https://play.echovideo.ru/", got)
 	}
-	if got := req.Header.Get("Referer"); got != "https://kwik.cx/" {
-		t.Errorf("Referer = %q, want https://kwik.cx/", got)
-	}
-	if got := req.Header.Get("Origin"); got != "https://kwik.cx" {
-		t.Errorf("Origin = %q, want https://kwik.cx", got)
+	if got := req.Header.Get("Origin"); got != "https://play.echovideo.ru" {
+		t.Errorf("Origin = %q, want https://play.echovideo.ru", got)
 	}
 	if got := req.Header.Get("Range"); got != "bytes=0-1023" {
 		t.Errorf("Range clobbered by the header baseline: %q", got)
@@ -141,9 +143,8 @@ func TestSmallMemoryPoolBudget(t *testing.T) {
 	const mem = 256 << 20
 	tuneTransports(mem)
 	a := httpClient.Transport.(*http.Transport)
-	b := h2Client.Transport.(*http.Transport)
-	if (a.MaxIdleConns+b.MaxIdleConns)*idleConnCost > mem/idleConnRAMShare {
-		t.Fatal("combined idle pools exceed RAM budget")
+	if a.MaxIdleConns*idleConnCost > mem/idleConnRAMShare {
+		t.Fatal("idle pool exceeds RAM budget")
 	}
 	if a.MaxIdleConnsPerHost > a.MaxIdleConns {
 		t.Fatal("host cap exceeds pool")
@@ -203,5 +204,121 @@ func TestUpstreamErrorsPassThroughOnce(t *testing.T) {
 		if calls != 1 || resp.StatusCode != status || resp.Header.Get("Retry-After") != "10" {
 			t.Fatalf("status %d was retried or changed", status)
 		}
+	}
+}
+
+func TestViewerDisconnectReleasesUpstreamAndCapacity(t *testing.T) {
+	oldClient, oldSlots := httpClient, inFlight
+	defer func() { httpClient, inFlight = oldClient, oldSlots }()
+	withEgress(t, newEgress(nil, nil, nil))
+	inFlight = make(chan struct{}, 1)
+	upstreamCanceled := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "1048576")
+		_, _ = w.Write(bytes.Repeat([]byte("s"), 64<<10))
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+		close(upstreamCanceled)
+	}))
+	defer origin.Close()
+	transport := newClient().Transport.(*http.Transport)
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
+	}
+	httpClient = &http.Client{Transport: transport}
+	defer httpClient.CloseIdleConnections()
+	handlerDone := make(chan struct{})
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(handlerDone)
+		handleProxy(w, r)
+	}))
+	defer proxy.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		proxy.URL+"/stream/"+EncodePayload("http://cdn.test/segment.ts", "", ""), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if _, err := io.ReadFull(resp.Body, make([]byte, 1024)); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	resp.Body.Close()
+	for _, event := range []struct {
+		name string
+		done <-chan struct{}
+	}{{"upstream request", upstreamCanceled}, {"proxy handler", handlerDone}} {
+		select {
+		case <-event.done:
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s survived viewer disconnect", event.name)
+		}
+	}
+	if len(inFlight) != 0 {
+		t.Fatal("viewer disconnect leaked a capacity slot")
+	}
+}
+
+// A canceled HTTP request can surface net.ErrClosed from its upstream socket
+// instead of context.Canceled. Active requests must still report that failure.
+type closedSocketBody struct {
+	cancel context.CancelFunc
+}
+
+func (b *closedSocketBody) Read([]byte) (int, error) {
+	if b.cancel != nil {
+		b.cancel()
+	}
+	return 0, &net.OpError{Op: "read", Net: "tcp", Err: net.ErrClosed}
+}
+func (*closedSocketBody) Close() error { return nil }
+
+func TestStreamClosedSocketLoggingDependsOnRequestCancellation(t *testing.T) {
+	oldClient, oldOutput := httpClient, log.Writer()
+	defer func() { httpClient = oldClient; log.SetOutput(oldOutput) }()
+	withEgress(t, newEgress(nil, nil, nil))
+	for _, canceled := range []bool{true, false} {
+		name := "active upstream failure"
+		if canceled {
+			name = "viewer canceled"
+		}
+		t.Run(name, func(t *testing.T) {
+			var logs bytes.Buffer
+			log.SetOutput(&logs)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			body := &closedSocketBody{}
+			if canceled {
+				body.cancel = cancel
+			}
+			httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, ContentLength: -1,
+					Header: http.Header{"Content-Type": {"video/mp2t"}}, Body: body, Request: r}, nil
+			})}
+			req := httptest.NewRequest(http.MethodGet,
+				"http://proxy.test/stream/"+EncodePayload("https://cdn.test/segment.ts", "", ""), nil).WithContext(ctx)
+			// Both failures must still abort the incomplete response.
+			func() {
+				defer func() {
+					if got := recover(); got != http.ErrAbortHandler {
+						t.Errorf("abort = %v, want http.ErrAbortHandler", got)
+					}
+				}()
+				handleProxy(httptest.NewRecorder(), req)
+			}()
+			logged := strings.Contains(logs.String(), "stream error:")
+			if logged == canceled {
+				t.Fatalf("canceled=%t logged=%t: %s", canceled, logged, logs.String())
+			}
+		})
 	}
 }

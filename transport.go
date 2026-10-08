@@ -42,9 +42,12 @@ func dialControl(network, address string, _ syscall.RawConn) error {
 // only enable it if a source actually needs it.
 var insecureTLS = getenv("INSECURE_TLS", "") == "1"
 
-// Shared clients preserve TCP/TLS connections across segments. Protocol choice
-// stays provider-specific; benchmark changes against the actual upstream.
-func newClient(http2 bool) *http.Client {
+// The shared client keeps TCP/TLS connections warm across segments. It speaks
+// HTTP/1.1 by default, with one connection per in-flight segment. The fastest
+// protocol depends on the upstream and concurrency. (A second HTTP/2 client existed
+// for the uwu CDN, which refused h1; uwu is retired and its CDN no longer
+// resolves, so it was removed Oct 2026. chromeClient covers h2-only hosts.)
+func newClient() *http.Client {
 	t := &http.Transport{
 		// Per-request egress decision: route blocked hosts through the clean
 		// proxy, everything else direct.
@@ -80,17 +83,8 @@ func newClient(http2 bool) *http.Client {
 		ResponseHeaderTimeout: 15 * time.Second,
 	}
 
-	if http2 {
-		t.ForceAttemptHTTP2 = true
-		t.HTTP2 = &http.HTTP2Config{
-			MaxReceiveBufferPerStream:     4<<20 - 1,
-			MaxReceiveBufferPerConnection: 4<<20 - 1,
-		}
-	} else {
-		// A non-nil empty TLSNextProto is what actually disables h2 negotiation.
-		t.ForceAttemptHTTP2 = false
-		t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
-	}
+	// A non-nil empty TLSNextProto is what actually disables h2 negotiation.
+	t.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 
 	return &http.Client{
 		// No Client.Timeout: a hard timeout here would also kill long video
@@ -107,12 +101,9 @@ func newClient(http2 bool) *http.Client {
 	}
 }
 
-var (
-	httpClient = newClient(false)
-	h2Client   = newClient(true)
-)
+var httpClient = newClient()
 
-// Budget idle HTTP buffers and TLS state across the two shared transports.
+// Budget idle HTTP buffers and TLS state for the shared transport.
 const (
 	defaultMaxIdleConns        = 1000
 	defaultMaxIdleConnsPerHost = 100
@@ -128,8 +119,7 @@ const (
 func tuneTransports(mem uint64) {
 	total := defaultMaxIdleConns
 	if mem > 0 {
-		// Split the RAM budget between the HTTP/1 and HTTP/2 transports.
-		total = max(1, min(int(mem/idleConnRAMShare/idleConnCost/2), maxIdleConnsCap))
+		total = max(1, min(int(mem/idleConnRAMShare/idleConnCost), maxIdleConnsCap))
 	}
 	if n := atoiDefault(getenv("MAX_IDLE_CONNS", ""), 0); n > 0 {
 		total = n
@@ -152,11 +142,9 @@ func tuneTransports(mem uint64) {
 		perHost = n
 	}
 
-	for _, c := range []*http.Client{httpClient, h2Client} {
-		t := c.Transport.(*http.Transport)
-		t.MaxIdleConns = total
-		t.MaxIdleConnsPerHost = perHost
-		t.MaxConnsPerHost = active
-	}
-	log.Printf("autotune: per transport idle=%d, idle/host=%d, active+idle/host=%d", total, perHost, active)
+	t := httpClient.Transport.(*http.Transport)
+	t.MaxIdleConns = total
+	t.MaxIdleConnsPerHost = perHost
+	t.MaxConnsPerHost = active
+	log.Printf("autotune: idle=%d, idle/host=%d, active+idle/host=%d", total, perHost, active)
 }
