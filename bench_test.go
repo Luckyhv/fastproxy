@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -24,7 +26,7 @@ func benchOrigin(size int) *httptest.Server {
 }
 
 // The proxy's downstream copy is what moves every byte of video. It runs
-// io.CopyBuffer(w, upstreamBody, 1MB-buf) against a real http.ResponseWriter
+// io.CopyBuffer(w, upstreamBody, pooled-buffer) against a real http.ResponseWriter
 // over a real TCP socket — the only setup that exercises the ReaderFrom path
 // net/http takes, so a Recorder-based benchmark would measure the wrong code.
 func benchmarkStream(b *testing.B, size int, forceBuf bool) {
@@ -96,10 +98,17 @@ func benchPlaylist(segments int, absolute bool) []byte {
 }
 
 func benchmarkRewrite(b *testing.B, absolute bool) {
-	body := benchPlaylist(1200, absolute)
+	benchmarkRewriteSize(b, 1200, absolute)
+}
+
+func benchmarkRewriteSize(b *testing.B, segments int, absolute bool) {
+	body := benchPlaylist(segments, absolute)
 	base, _ := url.Parse("https://cdn.example.com/v/abcdef0123456789/index.m3u8")
 	r := httptest.NewRequest("GET", "http://proxy.example.com/m3u8/tok", nil)
-	encode := func(uri string) string { return proxyURLFor(r, uri, "https://referer.site/", "wave") }
+	self := proxyBaseURL(r)
+	encode := func(uri string) string {
+		return self + proxyRoute(uri) + EncodePayload(uri, "https://referer.site/", "wave")
+	}
 
 	b.SetBytes(int64(len(body)))
 	b.ReportAllocs()
@@ -158,3 +167,87 @@ func BenchmarkBuffer32K(b *testing.B)  { benchmarkBufferSize(b, 32<<10) }
 func BenchmarkBuffer64K(b *testing.B)  { benchmarkBufferSize(b, 64<<10) }
 func BenchmarkBuffer256K(b *testing.B) { benchmarkBufferSize(b, 256<<10) }
 func BenchmarkBuffer1M(b *testing.B)   { benchmarkBufferSize(b, 1<<20) }
+
+func BenchmarkEncodePayload(b *testing.B) {
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if EncodePayload("https://cdn.example.com/v/abcdef0123456789/seg-00001.ts", "https://referer.site/", "wave") == "" {
+			b.Fatal("empty token")
+		}
+	}
+}
+
+func BenchmarkDecodePayload(b *testing.B) {
+	token := encodePayloadAt("https://cdn.example.com/v/abcdef0123456789/seg-00001.ts", "https://referer.site/", "wave", 0)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, _, _, ok := DecodePayload(token); !ok {
+			b.Fatal("invalid token")
+		}
+	}
+}
+
+func BenchmarkExtractPayload(b *testing.B) {
+	path := "/stream/signed-token/segment.ts"
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if extractPayload(path) != "signed-token" {
+			b.Fatal("wrong token")
+		}
+	}
+}
+
+// Exercise the complete production handler over TCP, including token decoding,
+// response headers, the resume wrapper, and the pooled streaming copy.
+func benchmarkProxySegment(b *testing.B, size int) {
+	origin := benchOrigin(size)
+	defer origin.Close()
+	oldClient, oldEgress := httpClient, egress
+	defer func() { httpClient, egress = oldClient, oldEgress }()
+	egress = newEgress(nil, nil, nil)
+	transport := newClient().Transport.(*http.Transport)
+	transport.Proxy = nil
+	transport.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, network, origin.Listener.Addr().String())
+	}
+	httpClient = &http.Client{Transport: transport}
+	defer httpClient.CloseIdleConnections()
+	proxy := httptest.NewServer(http.HandlerFunc(handleProxy))
+	defer proxy.Close()
+	client := &http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 64}}
+	defer client.CloseIdleConnections()
+	target := proxy.URL + "/stream/" + encodePayloadAt("http://cdn.test/segment.ts", "https://player.test/", "wave", 0)
+	b.SetBytes(int64(size))
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		resp, err := client.Get(target)
+		if err != nil {
+			b.Fatal(err)
+		}
+		n, err := io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || err != nil || n != int64(size) {
+			b.Fatalf("status=%d, copied %d/%d: %v", resp.StatusCode, n, size, err)
+		}
+	}
+}
+
+func BenchmarkProxySegment4MB(b *testing.B)  { benchmarkProxySegment(b, 4<<20) }
+func BenchmarkProxySegment32MB(b *testing.B) { benchmarkProxySegment(b, 32<<20) }
+
+func BenchmarkRewriteLiveRelative(b *testing.B) { benchmarkRewriteSize(b, 6, false) }
+func BenchmarkRewriteLiveAbsolute(b *testing.B) { benchmarkRewriteSize(b, 6, true) }
+
+func BenchmarkEncodePayloadParallel(b *testing.B) {
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			if EncodePayload("https://cdn.test/seg.ts", "https://player.test/", "wave") == "" {
+				b.Error("empty token")
+				return
+			}
+		}
+	})
+}

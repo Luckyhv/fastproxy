@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"net/url"
 	"strings"
 	"testing"
@@ -92,4 +93,39 @@ func TestIsAbsoluteHTTP(t *testing.T) {
 			t.Fatalf("isAbsoluteHTTP(%q) = %v, want %v", in, got, want)
 		}
 	}
+}
+
+// Compare the streaming scanner with a simple split/join reference on arbitrary
+// input. The large replacement prefix also exercises buffer growth estimates.
+func FuzzRewritePlaylistLineScanner(f *testing.F) {
+	for _, seed := range []string{
+		"", "#EXTM3U\nseg.ts\n", "#EXTM3U\r\n\r\nseg.ts\r\n",
+		`#EXT-X-KEY:URI="key.bin",URI="second.bin"` + "\nseg.ts",
+		"#comment\n\n#comment without newline",
+	} {
+		f.Add(seed)
+	}
+	base, _ := url.Parse("https://cdn.test/a/index.m3u8")
+	encode := func(uri string) string { return strings.Repeat("x", 512) + uri }
+	f.Fuzz(func(t *testing.T, input string) {
+		if len(input) > 8192 {
+			t.Skip()
+		}
+		lines := bytes.Split([]byte(input), []byte("\n"))
+		for i, line := range lines {
+			line = bytes.TrimRight(line, "\r")
+			switch {
+			case len(line) == 0:
+				lines[i] = line
+			case line[0] == '#':
+				lines[i] = []byte(rewriteTagLine(string(line), base, encode))
+			default:
+				lines[i] = []byte(encode(absoluteURI(string(line), base)))
+			}
+		}
+		want := bytes.Join(lines, []byte("\n"))
+		if got := rewritePlaylist([]byte(input), base, encode); !bytes.Equal(got, want) {
+			t.Fatalf("line scanner changed the rewritten representation for %q", input)
+		}
+	})
 }

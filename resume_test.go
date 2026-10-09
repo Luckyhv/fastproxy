@@ -216,3 +216,56 @@ func TestNoWrapForErrorStatus(t *testing.T) {
 		t.Fatal("wrapped an error response")
 	}
 }
+
+// Readers may report the last bytes and a connection error in the same call.
+// The next call may be EOF, which must not erase that earlier failure.
+type errorWithBytesBody struct {
+	sent bool
+}
+
+func (b *errorWithBytesBody) Read(p []byte) (int, error) {
+	if b.sent {
+		return 0, io.EOF
+	}
+	b.sent = true
+	return copy(p, object[:10]), io.ErrUnexpectedEOF
+}
+func (*errorWithBytesBody) Close() error { return nil }
+
+func TestResumePreservesErrorReturnedWithBytes(t *testing.T) {
+	for _, etag := range []string{"", `"v1"`} {
+		t.Run(etag, func(t *testing.T) {
+			var calls []string
+			resp := &http.Response{StatusCode: 200, ContentLength: -1,
+				Header: http.Header{"Etag": {etag}}, Body: &errorWithBytesBody{}}
+			got, err := io.ReadAll(newResumingBody(resp, 0, context.Background(), rangeServer(t, &calls, nil)))
+			if etag == "" {
+				if !errors.Is(err, io.ErrUnexpectedEOF) || string(got) != object[:10] || len(calls) != 0 {
+					t.Fatalf("unrecoverable cut: got %q, err=%v, requests=%v", got, err, calls)
+				}
+			} else if err != nil || string(got) != object || len(calls) != 1 {
+				t.Fatalf("recoverable cut: got %q, err=%v, requests=%v", got, err, calls)
+			}
+		})
+	}
+}
+
+func TestResumeReplayStopsAtOriginalRangeEnd(t *testing.T) {
+	var calls []string
+	resp := &http.Response{StatusCode: 206,
+		Header: http.Header{"Content-Range": {"bytes 5-20/36"}, "Etag": {`"v1"`}},
+		Body:   &cutBody{r: strings.NewReader(object[5:21]), left: 4}}
+	fetch := rangeServer(t, &calls, func(r *http.Response) {
+		r.StatusCode = 200
+		r.ContentLength = int64(len(object))
+		r.Header.Del("Content-Range")
+		r.Body = io.NopCloser(strings.NewReader(object))
+	})
+	got, err := io.ReadAll(newResumingBody(resp, 0, context.Background(), fetch))
+	if err != nil || string(got) != object[5:21] {
+		t.Fatalf("got %q, err=%v; want exactly %q", got, err, object[5:21])
+	}
+	if len(calls) != 1 || calls[0] != "bytes=9-20" {
+		t.Fatalf("range requests = %v", calls)
+	}
+}

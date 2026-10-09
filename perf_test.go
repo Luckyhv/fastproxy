@@ -71,6 +71,9 @@ func TestHasSuffixFold(t *testing.T) {
 // The token path skips url.Query() entirely, so make sure the raw-URL path is
 // still detected exactly when it should be.
 func TestRawURLQuery(t *testing.T) {
+	prev := allowRawURL
+	allowRawURL = true
+	defer func() { allowRawURL = prev }()
 	cases := map[string]bool{
 		"/stream/sometoken":                      false,
 		"/stream/sometoken?":                     false,
@@ -127,9 +130,6 @@ func TestTuneTransports(t *testing.T) {
 	}
 	if tr.MaxIdleConnsPerHost < 64 {
 		t.Fatalf("per-host cap regressed below the default: %d", tr.MaxIdleConnsPerHost)
-	}
-	if h2 := h2Client.Transport.(*http.Transport); h2.MaxIdleConns != tr.MaxIdleConns {
-		t.Fatalf("h2 client not tuned: %d", h2.MaxIdleConns)
 	}
 }
 
@@ -204,14 +204,12 @@ func TestCapacityMovesWithServer(t *testing.T) {
 		if cap(inFlight) != tc.want {
 			t.Fatalf("ram=%d capacity=%d want=%d", tc.ram, cap(inFlight), tc.want)
 		}
-		for _, c := range []*http.Client{httpClient, h2Client} {
-			tr := c.Transport.(*http.Transport)
-			if tr.MaxConnsPerHost != 0 {
-				t.Fatal("host cap must default to unlimited")
-			}
-			if tr.MaxIdleConnsPerHost > tr.MaxIdleConns {
-				t.Fatal("idle host exceeds total")
-			}
+		tr := httpClient.Transport.(*http.Transport)
+		if tr.MaxConnsPerHost != 0 {
+			t.Fatal("host cap must default to unlimited")
+		}
+		if tr.MaxIdleConnsPerHost > tr.MaxIdleConns {
+			t.Fatal("idle host exceeds total")
 		}
 	}
 }
@@ -245,7 +243,7 @@ func TestCapacityOverridesAndReset(t *testing.T) {
 func TestMinimumVPSConcurrentBurst(t *testing.T) {
 	isolateCapacity(t)
 	old := httpClient
-	httpClient = newClient(false)
+	httpClient = newClient()
 	defer func() { httpClient.Transport.(*http.Transport).CloseIdleConnections(); httpClient = old }()
 	tuneConcurrency(4 << 30)
 	tuneTransports(4 << 30)
@@ -308,5 +306,18 @@ func TestMinimumVPSConcurrentBurst(t *testing.T) {
 	}
 	if len(inFlight) != 0 {
 		t.Fatal("request capacity leaked")
+	}
+}
+
+func TestExtractPayloadRoutes(t *testing.T) {
+	for path, want := range map[string]string{
+		"": "", "/": "", "/stream": "", "/stream/": "",
+		"/m3u8/token/master.m3u8": "token", "/hls/token": "token",
+		"/stream/token/segment.ts": "token", "/token/suffix": "token",
+		"///token///": "token", "/unknown/token": "unknown",
+	} {
+		if got := extractPayload(path); got != want {
+			t.Errorf("extractPayload(%q) = %q, want %q", path, got, want)
+		}
 	}
 }

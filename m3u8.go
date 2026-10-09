@@ -103,7 +103,15 @@ func rewritePlaylist(body []byte, base *url.URL, encode func(string) string) []b
 	// playlist of short relative names ("seg-0001.ts") can grow 20x. Size from the
 	// real per-line cost instead of a flat multiple of the body, so a big playlist
 	// doesn't re-grow (and re-copy) a few hundred KB several times over.
-	out.Grow(min(len(body)+bytes.Count(body, []byte("\n"))*perLineOverhead, maxManifestSize))
+	// Comment lines usually pass through unchanged. Reserve the extra token
+	// space only for bare URL lines and embedded URI attributes. Blank lines
+	// may slightly overestimate capacity, which is harmless.
+	uriLines := bytes.Count(body, []byte("\n")) + 1 - bytes.Count(body, []byte("\n#"))
+	if bytes.HasPrefix(body, []byte("#")) {
+		uriLines--
+	}
+	uriLines += bytes.Count(body, []byte(`URI="`))
+	out.Grow(min(len(body)+uriLines*perLineOverhead, maxManifestSize))
 
 	// Mirrors bytes.Split exactly: a body ending in "\n" has a final empty line,
 	// so the trailing newline survives the round trip. Driving the loop off
@@ -126,7 +134,11 @@ func rewritePlaylist(body []byte, base *url.URL, encode func(string) string) []b
 			// blank line — keep as-is
 		case line[0] == '#':
 			// a tag line. Most pass through untouched; a few embed a URI="...".
-			out.WriteString(rewriteTagLine(string(line), base, encode))
+			if bytes.Contains(line, []byte(`URI="`)) {
+				out.WriteString(rewriteTagLine(string(line), base, encode))
+			} else {
+				out.Write(line)
+			}
 		default:
 			// a bare URL line: a segment (.ts/.m4s) or a variant playlist (.m3u8)
 			out.WriteString(encode(absoluteURI(string(line), base)))

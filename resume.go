@@ -38,6 +38,7 @@ type resumingBody struct {
 	total   int64 // object size; -1 = unknown
 	etag    string
 	resumes int
+	pending error // a read may return both bytes and an error
 }
 
 // newResumingBody wraps a 200/206 body so a mid-body cut can be healed;
@@ -105,7 +106,25 @@ func strongETag(tag string) string {
 
 func (b *resumingBody) Read(p []byte) (int, error) {
 	for {
-		n, err := b.body.Read(p)
+		if len(p) == 0 {
+			return 0, nil
+		}
+		// Bound replays to the original requested range, even when upstream ignores
+		// Range and sends the full object again.
+		if b.end >= 0 {
+			remaining := b.end - b.next + 1
+			if remaining <= 0 {
+				return 0, io.EOF
+			}
+			if int64(len(p)) > remaining {
+				p = p[:int(remaining)]
+			}
+		}
+		n, err := 0, b.pending
+		b.pending = nil
+		if err == nil {
+			n, err = b.body.Read(p)
+		}
 		b.next += int64(n)
 		if err == nil {
 			return n, nil
@@ -118,6 +137,7 @@ func (b *resumingBody) Read(p []byte) (int, error) {
 		// Short body or a broken read. Hand over what we got first; the
 		// resume happens on the next call with an empty buffer.
 		if n > 0 {
+			b.pending = err
 			return n, nil
 		}
 		if !b.resume() {
