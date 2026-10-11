@@ -5,8 +5,17 @@ Caddy as the TLS reverse proxy. This is the exact setup used for
 `proxy.anicore.tv`.
 
 ```
-browser → Cloudflare (public TLS, CDN cache) → Caddy :443 → fastproxy :3847
+browser → Cloudflare (public TLS, CDN cache) → fastproxy :443 (origin TLS, systemd socket)
 ```
+
+Since Oct 2026 fastproxy terminates the origin TLS itself (`TLS_CERT_FILE` /
+`TLS_KEY_FILE`) on a socket systemd owns (`fastproxy.socket`). Caddy in front used
+as much CPU as fastproxy (and 3–5x its RAM) to decrypt and copy every byte across
+a second hop; measured, the hop costs ~43% more CPU per GB. The systemd socket
+replaces Caddy's `lb_try_duration`: requests during a restart wait instead of
+failing. `switch-to-direct-tls.sh` moves an existing Caddy box over and rolls
+back by itself if the health check fails. The Caddy sections below are the old
+layout.
 
 Files in this folder:
 
@@ -48,7 +57,10 @@ go build -o fastproxy .
 ```sh
 cat > .env <<'EOF'
 PORT=3847
+# Required, 16+ chars, same value as anikage-api. Generate: openssl rand -base64 48
 SECRET_KEY=change-me
+# Token lifetime in seconds; 0 = never expire (default).
+TOKEN_TTL_SEC=0
 # Sites allowed to use the proxy (their Origin/Referer). Subdomains included.
 # This is the FRONTEND domain, not the proxy's own domain. Empty = open.
 ALLOWED_ORIGINS=yourfrontend.com,localhost

@@ -1,0 +1,13 @@
+# systemd owns port 443 and hands it to fastproxy (main.go listen()). The socket
+# stays open across `systemctl restart fastproxy`, so requests that arrive
+# mid-restart queue here instead of failing — what Caddy's lb_try_duration did.
+[Unit]
+Description=fastproxy listening socket
+
+[Socket]
+ListenStream=443
+Backlog=65535
+NoDelay=true
+
+[Install]
+WantedBy=sockets.target
