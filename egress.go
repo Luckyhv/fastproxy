@@ -192,9 +192,7 @@ func clientIP(r *http.Request) string {
 // at this point, so a replay can never duplicate bytes.
 func fetchUpstream(client *http.Client, req *http.Request, server, viewer string) (*http.Response, error) {
 	host := strings.ToLower(req.URL.Hostname())
-	// chromeClient cannot tunnel (see chrome.go), so it never enters the pool —
-	// handing it an exit would only be ignored and misreport the request.
-	if len(egress.proxies) == 0 || client == chromeClient {
+	if len(egress.proxies) == 0 {
 		resp, err := client.Do(req)
 		recordUpstream(host, resp, err, false)
 		return resp, err
@@ -206,7 +204,7 @@ func fetchUpstream(client *http.Client, req *http.Request, server, viewer string
 	if !egress.forced(host, server) {
 		resp, err := client.Do(req)
 		recordUpstream(host, resp, err, false)
-		if err != nil || resp.StatusCode != http.StatusTooManyRequests || !replayable {
+		if err != nil || !replayable || !(resp.StatusCode == http.StatusTooManyRequests || blockedChrome(client, resp)) {
 			return resp, err
 		}
 		resp.Body.Close()
@@ -222,7 +220,11 @@ func fetchUpstream(client *http.Client, req *http.Request, server, viewer string
 	for attempt := 0; attempt < attempts; attempt++ {
 		idx := egress.pick(key, attempt)
 		exit := egress.proxies[idx]
-		resp, err = client.Do(req.WithContext(context.WithValue(req.Context(), egressKey{}, exit)))
+		if client == chromeClient {
+			resp, err = chromeClientVia(exit).Do(req) // its own tunnel; see chrome.go
+		} else {
+			resp, err = client.Do(req.WithContext(context.WithValue(req.Context(), egressKey{}, exit)))
+		}
 		recordUpstream(host, resp, err, true)
 		if req.Context().Err() != nil {
 			return resp, err // the viewer left; not the exit's fault
@@ -236,8 +238,8 @@ func fetchUpstream(client *http.Client, req *http.Request, server, viewer string
 			if egress.markDown(idx) {
 				log.Printf("egress: proxy %s rejected credentials (407); skipping it for %s", exit.Host, proxyCooldown)
 			}
-		case resp.StatusCode == http.StatusTooManyRequests:
-			// This exit is throttled by this host; the next one may not be.
+		case resp.StatusCode == http.StatusTooManyRequests, blockedChrome(client, resp):
+			// This exit is throttled (or firewalled) by this host; the next one may not be.
 		default:
 			return resp, nil
 		}
@@ -246,6 +248,12 @@ func fetchUpstream(client *http.Client, req *http.Request, server, viewer string
 		}
 	}
 	return resp, err
+}
+
+// blockedChrome: a Chrome-TLS host's 403 is its Cloudflare firewall refusing the
+// egress IP (settlar blocks every box since Oct 14 2026), so it moves to the pool.
+func blockedChrome(client *http.Client, resp *http.Response) bool {
+	return client == chromeClient && resp.StatusCode == http.StatusForbidden
 }
 
 // redactURLError drops the *url.Error wrapper, whose message carries the full
