@@ -429,6 +429,10 @@ func handleProxy(w http.ResponseWriter, r *http.Request) {
 		serveManifest(w, r, resp, target, referer, server)
 		return
 	}
+	if hasSuffixFold(target.Path, ".vtt") && r.Method != http.MethodHead && resp.StatusCode == http.StatusOK {
+		serveVTT(w, r, resp, target, referer, server)
+		return
+	}
 
 	// 5. Pass through the safe subset of headers, then layer our cache policy on
 	//    top (long-immutable for media assets, no-store for error statuses).

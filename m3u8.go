@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"io"
+	"net/http"
 	"net/url"
 	"strings"
 )
@@ -182,4 +184,39 @@ func rewriteTagLine(line string, base *url.URL, encode func(string) string) stri
 		i = end + 1                                               // continue after it
 	}
 	return b.String()
+}
+
+// serveVTT passes subtitles through and rewrites thumbnail VTTs: their cues
+// name sprites relative to the VTT ("thumbnails/sprite_0.webp#xywh=..."), which
+// would resolve against our /stream/<token> path and 404. Each sprite gets its
+// own signed URL with the same identity, fragment kept.
+func serveVTT(w http.ResponseWriter, r *http.Request, resp *http.Response, base *url.URL, referer, server string) {
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxManifestSize))
+	if err != nil {
+		http.Error(w, "vtt read failed", http.StatusBadGateway)
+		return
+	}
+	if bytes.Contains(body, []byte("#xywh=")) {
+		self := proxyBaseURL(r)
+		body = rewriteThumbnailVTT(body, base, func(uri string) string {
+			return self + proxyRoute(uri) + EncodePayload(uri, referer, server)
+		})
+	}
+	h := w.Header()
+	h.Set("Content-Type", "text/vtt; charset=utf-8")
+	setAssetCache(h, base.Path, resp.StatusCode, "text/vtt")
+	w.WriteHeader(resp.StatusCode)
+	w.Write(body)
+}
+
+func rewriteThumbnailVTT(body []byte, base *url.URL, encode func(string) string) []byte {
+	lines := strings.Split(string(body), "\n")
+	for i, line := range lines {
+		ref, frag, ok := strings.Cut(strings.TrimRight(line, "\r"), "#xywh=")
+		if !ok || strings.Contains(line, "-->") {
+			continue
+		}
+		lines[i] = encode(absoluteURI(ref, base)) + "#xywh=" + frag
+	}
+	return []byte(strings.Join(lines, "\n"))
 }
